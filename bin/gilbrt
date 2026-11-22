@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# A normal foreground terminal command; no background model daemon is installed.
+set -euo pipefail
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+  script_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
+  link_target="$(readlink "$script_path")"
+  case "$link_target" in
+    /*) script_path="$link_target" ;;
+    *) script_path="$script_dir/$link_target" ;;
+  esac
+done
+project_dir="$(cd -P "$(dirname "$script_path")/.." && pwd)"
+export GILBRT_RUNTIME="${GILBRT_RUNTIME:-$project_dir/.runtime}"
+for candidate in "$project_dir/.venv-bash/bin/python" "$project_dir/.venv-bash/Scripts/python.exe" "$project_dir/.venv/bin/python" "$project_dir/.venv/Scripts/python.exe"; do
+  if [[ -x "$candidate" ]]; then
+    if [[ "$candidate" == *.exe ]] && command -v cygpath >/dev/null; then
+      export GILBRT_RUNTIME="$(cygpath -m "$GILBRT_RUNTIME")"
+    fi
+    if [[ "$candidate" == *.exe && -t 0 && -t 1 ]] && command -v winpty >/dev/null; then
+      # Mintty presents pipes to native Windows Python; winpty provides a real TTY.
+      exec winpty "$candidate" -m gilbrt "$@"
+    fi
+    exec "$candidate" -m gilbrt "$@"
+  fi
+done
+printf '%s\n' 'gilbrt is not installed in this checkout. Run: bash install.sh' >&2
+exit 1

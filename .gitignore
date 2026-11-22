@@ -1,0 +1,16 @@
+.venv/
+.venv-bash/
+__pycache__/
+*.egg-info/
+build/
+dist/
+audit.*
+active.local.json
+.runtime/
+diagnostics.json
+gilbrt-report.*
+gilbrt-source.zip
+node_modules/
+.env
+.env.*
+!.env.example

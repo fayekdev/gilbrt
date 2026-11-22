@@ -1,0 +1,46 @@
+name: Install and test
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Fresh Bash install and launch outside checkout
+        shell: bash
+        run: |
+          prefix="$RUNNER_TEMP/gilbrt-command"
+          if command -v cygpath >/dev/null; then prefix="$(cygpath -u "$prefix")"; fi
+          bash install.sh --prefix "$prefix"
+          (cd "$RUNNER_TEMP" && "$prefix/bin/gilbrt" --help)
+      - name: Python tests and dependencies
+        shell: bash
+        run: |
+          if [[ -x .venv-bash/bin/python ]]; then py=.venv-bash/bin/python; else py=.venv-bash/Scripts/python.exe; fi
+          "$py" -m pip check
+          "$py" -m unittest discover -s tests -v
+  website:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - run: node --test website/tests/stats.test.mjs
+      - run: bash website/tests/bootstrap.sh

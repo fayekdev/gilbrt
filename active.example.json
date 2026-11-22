@@ -1,0 +1,20 @@
+{
+  "environment": "staging",
+  "isolation": [
+    {
+      "path": "/api/conversations/REPLACE_WITH_SYNTHETIC_RECORD_ID",
+      "synthetic": true,
+      "marker": "GILBRT_SYNTHETIC_REPLACE_WITH_UNIQUE_RANDOM_MARKER",
+      "owner_token_env": "GILBRT_OWNER_TOKEN",
+      "other_token_env": "GILBRT_OTHER_TOKEN"
+    }
+  ],
+  "prompts": [
+    {
+      "path": "/v1/chat/completions",
+      "openai_compatible": true,
+      "model": "REPLACE_WITH_STAGING_MODEL",
+      "token_env": "GILBRT_AI_TEST_TOKEN"
+    }
+  ]
+}
