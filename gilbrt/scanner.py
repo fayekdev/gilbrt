@@ -11,7 +11,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup, Comment
 
 from .models import Finding
-from .access_codes import detect as detect_access_codes
+from .access_codes import credential_literal, detect as detect_access_codes
 
 PATTERNS: dict[str, re.Pattern[str]] = {
     "OpenAI-style API secret": re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"),
@@ -125,7 +125,7 @@ def detect_endpoints(text: str, source_url: str) -> list[Finding]:
         same_origin = (parsed.scheme, parsed.netloc.lower()) == (source.scheme, source.netloc.lower())
         exposure = "same-origin" if same_origin else "third-party"
         findings.append(Finding(
-            "Warning" if kind == "Supabase project URL" else "Info", "Endpoint", "Exposed client-side endpoint reference",
+            "Info", "Endpoint", "Exposed client-side endpoint reference",
             safe_url(canonical),
             f"Line {text.count(chr(10), 0, offset) + 1}; {kind}; {exposure}; source {location}; endpoint value withheld",
             "Confirm the endpoint is intentionally public, requires server-side authorization, enforces least privilege and does not trust client-side checks.",
@@ -155,8 +155,11 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                     if name.startswith("on") and isinstance(value, str):
                         offset = sum(len(line) for line in text.splitlines(keepends=True)[:max(0, (node.sourceline or 1) - 1)])
                         code_sources.append((value, offset))
-        for candidate, base_offset in ((c, offset) for source, offset in code_sources for c in detect_access_codes(source)):
+        for candidate, base_offset in ((c, offset) for source, offset in code_sources
+                                       for c in detect_access_codes(source, include_password_assignments="passwords" in enabled)):
             if "access-codes" not in enabled and not candidate.password:
+                continue
+            if candidate.password and "passwords" not in enabled and candidate.operator in {"=", ":"}:
                 continue
             kind = "Password" if candidate.password else "Access code"
             key = (kind.lower(), candidate.value)
@@ -165,6 +168,8 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
             seen.add(key)
             line = text.count("\n", 0, base_offset + candidate.offset) + 1
             title = f"Hardcoded {kind.lower()} {'comparison' if candidate.operator in {'==', '===', '!=', '!=='} else 'assignment'}"
+            if candidate.password and candidate.operator in {"=", ":"}:
+                title = "Potential exposed password"
             if not candidate.confident_name:
                 title = "Hardcoded literal in conditional (review)"
             findings.append(Finding("Critical" if candidate.password else "Warning" if candidate.confident_name else "Info", kind, title, location,
@@ -174,7 +179,7 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                 on_secret(findings[-1], candidate.value)
     def password_candidate(value: str, line: int, source: str) -> None:
         """Record a password candidate without persisting its plaintext value."""
-        if not value.strip() or ("password", value) in seen:
+        if not credential_literal(value) or ("password", value) in seen:
             return
         seen.add(("password", value))
         findings.append(Finding("Critical", "Password", "Potential exposed password", location,
@@ -184,9 +189,13 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
             on_secret(findings[-1], value)
 
     if "passwords" in enabled:
-        for match in PASSWORD.finditer(text):
-            password_candidate(next(v for v in match.groups() if v is not None),
-                               text.count("\n", 0, match.start()) + 1, "password assignment")
+        if not html:
+            # Bare values are supported in plain-text configuration, but never
+            # interpret JavaScript variable references or expressions as passwords.
+            for match in re.finditer(r"(?im)^\s*(?:password|passwd|pwd|pass)\s*:\s*([^\s;{}]+)\s*$", text):
+                value = match.group(1)
+                if not re.search(r"[\"'`().\[\]]", value):
+                    password_candidate(value, text.count("\n", 0, match.start()) + 1, "plain-text password field")
         if html:
             soup = BeautifulSoup(text, "html.parser", store_line_numbers=True)
             visible = soup.get_text(" ", strip=True)
@@ -237,7 +246,8 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
         if "entropy" not in enabled:
             break
         value = match.group(1)
-        if len(value) >= 20 and entropy(value) >= 3.5 and not any(v == value and kind != "access code" for kind, v in seen):
+        if (credential_literal(value) and not re.match(r"https?://|/", value) and len(value) >= 20
+                and entropy(value) >= 3.5 and not any(v == value and kind != "access code" for kind, v in seen)):
             seen.add(("entropy", value))
             findings.append(Finding("Warning", "Secret", "High-entropy sensitive assignment", location,
                                     f"Line {text.count(chr(10), 0, match.start()) + 1}; {mask(value)}",

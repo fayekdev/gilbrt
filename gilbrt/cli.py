@@ -13,11 +13,12 @@ from rich.text import Text
 
 from .active import load_config, run_active
 from .breach_check import check_breaches
+from .branding import print_startup
 from .crawler import Crawler, ScopedClient, normalize
 from .headers import analyze_headers, analyze_tls
 from .menu import select_checks
 from .local_ai import LocalAnalyzer
-from .bundled_ai import BundledAnalyzer, available as bundled_available
+from .bundled_ai import BundledAnalyzer, RUNTIME, available as bundled_available
 from .models import Finding
 from .reporter import copy_to_clipboard, export, print_summary, render_report
 from .scanner import CONTENT_CHECKS, safe_url, scan
@@ -29,7 +30,7 @@ SEARCH_OPTIONS = DEFAULT_CHECKS + ["local-ai"]
 
 def installed_model_default() -> str:
     """Read the installer-selected local model without treating it as code."""
-    path = Path(__file__).resolve().parents[1] / ".runtime" / "default_model.txt"
+    path = RUNTIME / "default_model.txt"
     try:
         value = path.read_text(encoding="utf-8").strip()
         return value if re.fullmatch(r"[A-Za-z0-9._/-]+(?::[A-Za-z0-9._-]+)?|bundled", value) else "bundled"
@@ -112,6 +113,10 @@ def parser() -> argparse.ArgumentParser:
                    help="Comma-separated selection (repeatable): all, " + ", ".join(SEARCH_OPTIONS))
     p.add_argument("--interactive", action="store_true", help="Show the guided flow with selectable checkboxes")
     p.add_argument("--update", action="store_true", help="Safely fast-forward and reinstall this Git checkout, then exit")
+    models = p.add_mutually_exclusive_group()
+    models.add_argument("--list-models", action="store_true", help="Show local model recommendations for this machine; no downloads")
+    models.add_argument("--install-models", nargs="?", const="choose", metavar="MODEL",
+                        help="Recommend and install a local model; optionally specify bundled or ollama:TAG")
     p.add_argument("--show-secrets", action="store_true",
                    help="Reveal matched values in the local terminal; exports remain redacted")
     p.add_argument("--include-url", action="append", default=[], metavar="PATH_OR_URL",
@@ -127,7 +132,8 @@ def parser() -> argparse.ArgumentParser:
 
 def interactive_setup(args: argparse.Namespace, console: Console, selected: set[str]) -> set[str]:
     """Collect website, check selection and report preferences without making requests."""
-    console.print("gilbrt — guided website audit", style="bold cyan")
+    print_startup(console)
+    console.print("gilbrt — guided website audit", style="bold #a8d65c")
     if not args.url:
         while True:
             try:
@@ -161,6 +167,17 @@ def main(argv: list[str] | None = None) -> int:
     p = parser()
     arguments = sys.argv[1:] if argv is None else argv
     args = p.parse_args(arguments)
+    if args.list_models or args.install_models is not None:
+        from .model_install import manage_models
+        console = Console()
+        try:
+            return manage_models(args.install_models, console)
+        except (KeyboardInterrupt, EOFError):
+            console.print("Model installation cancelled.", style="yellow")
+            return 130
+        except (OSError, ValueError, RuntimeError) as error:
+            console.print(str(error), style="red", markup=False)
+            return 1
     if args.update:
         console = Console()
         try:
@@ -203,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.active != bool(args.active_config):
         p.error("--active and --active-config must be used together")
     args.format = args.format or "json"
+    if not args.interactive:
+        print_startup(console)
     console.print(DISCLAIMER, style="bold yellow", markup=False)
     client = None
     analyzer = None

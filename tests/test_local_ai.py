@@ -3,13 +3,14 @@
 import json
 import threading
 import unittest
+from unittest.mock import patch
 import io
 import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from gilbrt.local_ai import LocalAnalyzer, chunks, loopback_url, ground_quote
+from gilbrt.local_ai import LocalAnalyzer, chunks, loopback_url, ground_quote, control_context
 from gilbrt.cli import main
 
 
@@ -144,6 +145,33 @@ class LocalAITests(unittest.TestCase):
         for url in ("http://remote.invalid", "http://localhost:11434", "http://127.0.0.1:11434/api", "http://user:pass@127.0.0.1"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 loopback_url(url)
+
+    def test_control_context_requires_evidence_in_the_actual_comparison(self) -> None:
+        for source, quote, value in [
+            ('const passwordLabel="Password"; if(theme === "dark")render();', 'theme === "dark"', "dark"),
+            ('if(response.code === 1000)close();', 'response.code === 1000', "1000"),
+            ('const secret="YOUR_SECRET";', 'secret="YOUR_SECRET"', "YOUR_SECRET"),
+        ]:
+            with self.subTest(source=source):
+                self.assertFalse(control_context(source, quote, source.index(quote), value))
+        source = 'if(x === "actual-gate")openGate();'
+        quote = 'x === "actual-gate"'
+        self.assertTrue(control_context(source, quote, source.index(quote), "actual-gate"))
+
+    def test_model_password_claim_cannot_override_syntax_classification(self) -> None:
+        analyzer = LocalAnalyzer("test-coder:1b", self.url)
+        source = 'const passwordLabel="Password"; if(code === "4827")allow();'
+        output = {"done": True, "response": json.dumps({"findings": [
+            {"kind": "password", "quote": 'code === "4827"', "value": "4827"},
+            {"kind": "password", "quote": 'passwordLabel="Password"', "value": "Password"},
+        ]})}
+        try:
+            with patch.object(analyzer, "verify_model"), patch.object(analyzer, "request", return_value=output):
+                findings = analyzer.analyze(source, "https://authorized.invalid/")
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].severity, "Warning")
+        finally:
+            analyzer.close()
 
     def test_keyword_windows_are_prioritized(self) -> None:
         text = "A" * 20000 + 'const adminCode="fixture-ai-code";'

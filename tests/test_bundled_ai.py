@@ -50,6 +50,20 @@ class BundledTests(unittest.TestCase):
         self.assertTrue(analyzer.candidate_limit_reached)
         self.assertEqual(analyzer.reviewed_candidates, 24)
 
+    def test_model_cannot_promote_ui_constants_or_nearby_password_words(self) -> None:
+        analyzer = self.stub_analyzer()
+        source = '''const passwordLabel = "Password";
+        if(theme === "dark") render();
+        if(response.code === 1000) close();
+        const admin = true; if(x === "sidebar") render();'''
+        self.assertEqual(analyzer.analyze(source, "https://test.invalid/main.js"), [])
+        analyzer.request.assert_not_called()
+        findings = analyzer.analyze('const passwordLabel="Password"; if(code==="4827")allow();',
+                                    "https://test.invalid/gate.js")
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "Warning")
+        self.assertEqual(findings[0].category, "Local AI")
+
     def test_reviewed_password_is_critical_and_reveal_targets_its_row(self) -> None:
         analyzer = self.stub_analyzer()
         visible = {}

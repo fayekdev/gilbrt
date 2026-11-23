@@ -158,7 +158,7 @@ class BundledAnalyzer(LocalAnalyzer):
         best = []
         serial = 0
         for source, base_line in sources(text, html):
-            source_candidates = candidates(source, limit=self.candidate_limit + 1)
+            source_candidates = candidates(source, limit=self.candidate_limit + 1, include_password_assignments=True)
             if len(source_candidates) > self.candidate_limit:
                 self.candidate_limit_reached = True
             for candidate, context, score in source_candidates:
@@ -255,9 +255,8 @@ class BundledAnalyzer(LocalAnalyzer):
         if (url, candidate.value) in self.seen:
             return
         self.seen.add((url, candidate.value))
-        password = candidate.password or bool(re.search(r"password|passwd|passcode", context, re.I))
-        credential = password or bool(re.search(r"admin|login|unlock|access.?code|\bpin\b", context, re.I))
-        finding = Finding("Critical" if credential else "Warning", "Password" if password else "Local AI",
+        password = candidate.password
+        finding = Finding("Critical" if password else "Warning", "Password" if password else "Local AI",
             "Model-reviewed password candidate" if password else "Model-reviewed client-side access candidate", safe_url(url),
             f"Line {line}; operator {candidate.operator}; {mask(candidate.value)}; literal verified by JavaScript parser, meaning unconfirmed",
             "Review this access check and enforce authorization server-side; rotate actual exposed credentials.")

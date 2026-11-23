@@ -10,8 +10,19 @@ from dataclasses import dataclass
 LEXER = re.compile(
     r'''(?P<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|(?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(?P<number>\b\d+(?:\.\d+)?\b)|(?P<identifier>[A-Za-z_$][\w$]*)|(?P<operator>===|!==|==|!=|=>|&&|\|\|)|(?P<symbol>[^\s])'''
 )
-PASSWORD_NAME = re.compile(r"password|passwd|(?:^|[_-])(?:pwd|pass)(?:$|[_-])", re.I)
-CODE_NAME = re.compile(r"passcode|(?:access|invite|unlock|security|verification|auth)[_-]?code|secret|(?:^|[_-])(?:code|pin|otp)(?:$|[_-])", re.I)
+PASSWORD_NAME = re.compile(r"(?:^|[_-])(?:password|passwd|pwd|pass)(?:[_-]?input)?$", re.I)
+CODE_NAME = re.compile(r"(?:^|[_-])(?:passcode|(?:access|invite|unlock|security|verification|auth|admin)[_-]?code|secret|pin|otp)$", re.I)
+
+
+def credential_literal(value: str) -> bool:
+    """Exclude empty values, templates, redactions and explicit example placeholders."""
+    value = value.strip()
+    if not value or (len(set(value)) == 1 and value[0] in "*•xX_-."):
+        return False
+    if re.fullmatch(r"(?:null|undefined|true|false|none|redacted|placeholder|your[_ -].*|(?:example|dummy|sample)[_-](?:key|token|secret|password|code))", value, re.I):
+        return False
+    return not (re.search(r"\$\{|\{\{|<[^>]+>", value) or
+                re.match(r"(?:process\.env\.|import\.meta\.env\.|os\.environ)", value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +133,8 @@ def _detect_lexical(text: str) -> list[Candidate]:
     return candidates
 
 
-def detect(text: str) -> list[Candidate]:
+def detect(text: str, include_password_assignments: bool = False) -> list[Candidate]:
     """Use JavaScript syntax to detect literal checks, including minified branches."""
     from .js_parser import candidates
-    return [candidate for candidate, _, _ in candidates(text)]
+    return [candidate for candidate, _, _ in candidates(text, limit=4096,
+            include_password_assignments=include_password_assignments)]

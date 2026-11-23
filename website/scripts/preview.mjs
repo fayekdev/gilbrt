@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import stats from '../api/stats.js';
 const root = path.resolve(fileURLToPath(new URL('../public/', import.meta.url)));
-const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.sh': 'text/plain' };
+const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json', '.sh': 'text/plain' };
 http.createServer(async (req, res) => {
   if (new URL(req.url, 'http://localhost').pathname === '/api/stats') {
     res.status = value => { res.statusCode = value; return res; };

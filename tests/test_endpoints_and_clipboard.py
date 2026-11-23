@@ -17,7 +17,7 @@ class EndpointAndClipboardTests(unittest.TestCase):
         self.assertEqual(len(findings), 2)
         self.assertTrue(all(item.category == "Endpoint" for item in findings))
         self.assertNotIn("private/users", " ".join(item.evidence + item.url for item in findings))
-        self.assertTrue(any(item.severity == "Warning" for item in findings))
+        self.assertTrue(all(item.severity == "Info" for item in findings))
 
     def test_supabase_and_provider_tokens_are_redacted(self) -> None:
         values = ["sb_secret_" + "A" * 30, "npm_" + "B" * 36, "glpat-" + "C" * 24]

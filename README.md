@@ -71,6 +71,32 @@ therefore needs a separate audit of the HTTPS target.
 
 ## Options
 
+Install local AI models after installing gilbrt:
+
+```bash
+gilbrt --install-models
+```
+
+This checks available RAM, CPU architecture, OS and whether Ollama is installed,
+shows estimated model downloads and memory needs, and lets you choose a suitable
+model. The largest model within the conservative RAM estimate is recommended;
+without Ollama, the supported bundled CPU model is recommended. These are CPU/RAM
+estimates, not speed or GPU compatibility guarantees. Unknown or insufficient
+available memory prevents installation; close other apps and retry.
+
+```bash
+gilbrt --list-models                         # preview only; no downloads
+gilbrt --install-models bundled              # explicit bundled installation
+gilbrt --install-models ollama:qwen2.5-coder:1.5b
+```
+
+Supported choices are the bundled Qwen2.5-Coder 0.5B model and Ollama
+Qwen2.5-Coder 0.5B, 1.5B, 3B and 7B. Ollama choices require an existing local
+Ollama installation and running server. Successful installation saves the default
+model for the audit wizard; enable `local-ai` there or pass `--local-model TAG`.
+Scripts must specify a model explicitly. `GILBRT_RUNTIME` can select the bundled
+runtime and default-model directory. Normal audits never download models.
+
 - `--confirm-authorized`: required in scripts; the guided flow asks for equivalent
   confirmation interactively. Prints the authorization disclaimer before requests.
 - `--max-depth 2`: document link depth; root is depth zero. Script assets do not add depth.
@@ -128,14 +154,16 @@ Categories: `passwords`, `access-codes`, `api-keys`, `tokens`, `private-keys`, `
 `local-ai` is an additional opt-in checkbox, initially unchecked and excluded from
 the CLI `all` selection. It requires an installed local model.
 
-Password checks do not require high entropy: they find quoted and unquoted
+Password checks do not require high entropy: they find literal
 `password`, `passwd`, `pwd`, `pass` and prefixed assignments such as `dbPassword`
 or `DB_PASSWORD`, prefilled password-related HTML fields, and password data
-attributes. They scan visible password assignments and comments too.
+attributes. JavaScript assignments must contain an actual string or numeric
+literal; variable references, comments and quoted code examples are skipped.
+Visible password fields and plain-text `password: value` fields are also checked.
 HTML tables with a password-labeled first column are also checked. Source-map
 `sourcesContent` is decoded before scanning, including its escaped source text.
-Findings are candidates: sample strings and variable references can be false
-positives. Values are never tried against a login service.
+Empty values, explicit placeholders, environment templates and masked values are
+filtered out. Findings remain candidates; values are never tried against a login service.
 
 The `access-codes` check also detects client-side gates such as
 `if (code === "4827")`, `if (pin !== 7392)` and reversed comparisons such as
@@ -150,8 +178,12 @@ are scanned after decoding. These checks do not require high entropy.
 
 In the checkbox menu, choose `access-codes` (selected by default with all checks).
 Password findings are Critical; other comparisons with descriptive code names are Warning candidates. Generic
-or minified `if` comparisons such as `if(x === "example-gate")` are Info review
-candidates because ordinary UI conditions can look identical to access checks.
+or minified comparisons require access-specific actions in their enclosing branch,
+such as `if(x === "example-gate") unlock()`, and remain Info review candidates.
+An arbitrary string comparison alone is ignored. Generic `code` assignments and
+HTTP/error/keyboard code properties are ignored; a bare `code` comparison needs
+a PIN-shaped numeric value or an access-specific branch. UI labels, credential
+metadata properties and ordinary status/type checks are excluded.
 The detector skips JavaScript comments, quoted code examples and dynamic template
 strings. Tree-sitter parses JavaScript syntax, including regex literals and
 template substitutions, to avoid confusing quotes with comparisons. It does not evaluate code;
@@ -167,8 +199,9 @@ from an unlinked API or requiring authentication may remain outside coverage.
 
 `--show-secrets` is an explicit exception to terminal redaction: matched values
 appear in full in their terminal table rows, replacing the masked marker.
-Password findings are Critical; password/admin credentials flagged by model review
-are also prioritized as Critical. Severity is triage priority, not proof of exploitation.
+Password findings are Critical. Model-reviewed access-code candidates are Warning;
+nearby words such as `password` or `admin` do not promote an unrelated value to a
+Critical password finding. Severity is triage priority, not proof of exploitation.
 Terminal control characters are displayed as escapes. Recording/scrollback may retain values.
 JSON/CSV/HTML reports always remain redacted. Do not redirect a revealed terminal
 session to a public log. Default output stays masked. URL validation rejects
@@ -311,7 +344,9 @@ from 1 to 100. Coverage reports distinguish submitted/completed chunks and budge
 exhaustion. Large/minified programs can exceed this budget or cross chunk boundaries.
 
 Model responses must be structured JSON. Each accepted candidate must match
-actual source tokens and a string/numeric literal in that source. Whitespace and
+actual source tokens and a qualifying credential assignment or access comparison
+under the same syntax rules used by static checks. A model claim alone cannot
+turn an ordinary comparison into a finding. Whitespace and
 equivalent string quote spelling may differ; operators and identifiers must match.
 The tool discards invented values, never executes model-generated actions,
 and withholds model prose from reports. A verified literal does not prove it is

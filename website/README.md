@@ -15,6 +15,21 @@ Open http://127.0.0.1:4173. Run `npm test` for the stats endpoint tests. With Ba
 
 ## Deploy on Vercel
 
+### Mascot assets
+
+The hero uses the original ASCII detective in `public/gilbrt-mascot.js`, colored
+with darker lime `#a8d65c`. Its external shadow stylesheet, `mascot.css`, keeps
+the idle motion and face blink compatible with the site's Content Security Policy.
+It respects reduced-motion preferences and accepts a `paused` attribute. A static
+SVG fallback remains visible when JavaScript is disabled.
+
+`mascot.svg` is the simplified navigation/footer logo. `favicon.svg` and the
+16/32/48-pixel `favicon.ico` cover browser tabs; the web manifest references
+192/512-pixel icons and a maskable icon, with a separate 180-pixel Apple touch icon.
+These provide app branding without adding offline or service-worker behavior.
+
+### Hosting
+
 1. Commit the `website/` folder to the gilbrt repository and import that repository into Vercel.
 2. Set **Root Directory** to `website`, **Framework Preset** to `Other`, and **Output Directory** to `public`. No install or build command is needed. The checked-in `vercel.json` configures the output and script headers. Vercel deploys `api/stats.js` as a Function.
 3. Optionally add a server-only `GITHUB_TOKEN` environment variable with repository metadata read access, then redeploy. It is used only by the stats Function, never sent to the browser. Omit it for a public repository; do not prefix it with `NEXT_PUBLIC_` or `VITE_`.

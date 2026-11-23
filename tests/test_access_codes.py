@@ -47,8 +47,11 @@ class AccessCodeTests(unittest.TestCase):
         self.assertEqual(revealed, ["test-password"])
         self.assertEqual(findings[0].title, "Hardcoded password comparison")
 
-    def test_minified_if_is_labeled_as_review_candidate(self) -> None:
+    def test_minified_if_requires_access_evidence(self) -> None:
         findings, revealed = self.candidates('if(x==="gate-synthetic")a();')
+        self.assertEqual(findings, [])
+        self.assertEqual(revealed, [])
+        findings, revealed = self.candidates('if(x==="gate-synthetic")unlock();')
         self.assertEqual(revealed, ["gate-synthetic"])
         self.assertEqual(findings[0].severity, "Info")
         self.assertIn("review", findings[0].title)
@@ -65,6 +68,46 @@ class AccessCodeTests(unittest.TestCase):
         self.assertFalse(findings)
         self.assertFalse(revealed)
 
+    def test_ui_and_protocol_constants_are_not_access_codes(self) -> None:
+        cases = [
+            'if(theme === "dark") render();',
+            'if(route === "/admin") navigate();',
+            'if(event.code === "Enter") submit();',
+            'if(response.code === 1000) close();',
+            'if(error.code === "ECONNRESET") retry();',
+            'const code = "application/json";',
+            'const sourceCode = "console.log(1)";',
+            'if(password.type === "password") show();',
+            'if(secret.status === "active") render();',
+            'if(authProvider === "google") loginButton();',
+            'const passwordLabel = "Enter password";',
+            'const secretName = "application-config";',
+            'const accessCode = "YOUR_ACCESS_CODE";',
+            'const password = process.env.PASSWORD;',
+            'const password = storedPassword;',
+            'password = storedPassword',
+            'const password = "${PASSWORD}";',
+            'const password = "********";',
+            'const password = "";',
+            'const password = false;',
+            '// password="comment-example"',
+            '''const sample = 'password="quoted-example"';''',
+            'const admin = true; if(x === "sidebar") render();',
+            'if(x === "sidebar") { /* unlock admin password */ render(); }',
+            'if(x === "sidebar") log(login);',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.candidates(source, {"access-codes", "passwords"})[0], [])
+
+    def test_credential_assignments_still_detect_real_literals(self) -> None:
+        for source in ('const dbPassword = "hunter2";',
+                       'const config = {password: "hunter2"};',
+                       'const adminCode = "4827";',
+                       'const unlockCode = "4827";'):
+            with self.subTest(source=source):
+                self.assertTrue(self.candidates(source, {"access-codes", "passwords"})[0])
+
     def test_escaped_literal_and_source_map(self) -> None:
         source = r'if (code === "\x34\u0038\x32\x37") allow();'
         self.assertIn("4827", self.candidates(source)[1])
@@ -79,7 +122,7 @@ class AccessCodeTests(unittest.TestCase):
         self.assertTrue(findings)
 
     def test_template_interpolation_is_parsed_as_code(self) -> None:
-        source = '''const view = `<p>${entered == "fixture-pin" ? "allowed" : "denied"}</p>`;'''
+        source = '''const view = `<p>${enteredPin == "fixture-pin" ? "allowed" : "denied"}</p>`;'''
         self.assertIn("fixture-pin", self.candidates(source)[1])
 
     def test_exports_redact_codes_and_unselected_category_stays_quiet(self) -> None:

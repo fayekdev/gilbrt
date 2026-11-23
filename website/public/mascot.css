@@ -1,0 +1,13 @@
+/* Shadow DOM stylesheet; keep external for style-src 'self'. */
+:host{display:block;width:100%;background:transparent}
+svg{display:block;width:100%;height:auto;overflow:visible}
+text{font-family:"Courier New",Courier,monospace;font-size:14px;font-weight:700;font-variant-ligatures:none;white-space:pre}
+.float{transform-box:view-box;transform-origin:50% 90%;animation:gilbrt-idle 3.6s ease-in-out infinite}
+.face{animation:gilbrt-blink 5.6s linear infinite}
+.signal{animation:gilbrt-signal 3s ease-in-out infinite}
+:host([light]) .face{fill:#263129}
+:host([paused]) .float,:host([paused]) .face,:host([paused]) .signal{animation-play-state:paused}
+@keyframes gilbrt-idle{0%,100%{transform:translateY(0) rotate(-.35deg)}50%{transform:translateY(-5px) rotate(.35deg)}}
+@keyframes gilbrt-blink{0%,91%,95%,100%{opacity:1}92%,94%{opacity:.08}}
+@keyframes gilbrt-signal{0%,100%{opacity:.75}50%{opacity:1}}
+@media(prefers-reduced-motion:reduce){.float,.face,.signal{animation:none}}

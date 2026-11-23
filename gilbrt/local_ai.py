@@ -111,18 +111,10 @@ def ground_quote(source: str, quote: str) -> tuple[str, int] | None:
 
 
 def control_context(source: str, quote: str, offset: int, value: str) -> bool:
-    """Require credential naming or nearby control syntax in addition to a model claim."""
-    context = source[max(0, offset - 100):offset + len(quote) + 100]
-    if re.search(r"password|passwd|passcode|admin|access.?code|secret|\bpin\b|\botp\b|auth|unlock|login|verify", context, re.I):
-        return True
-    tokens = [Token(m.group(), m.lastgroup or "symbol", m.start())
-              for m in LEXER.finditer(context) if m.lastgroup != "comment"]
-    for index, token in enumerate(tokens):
-        if token.kind in {"string", "number"} and literal([token]) == value:
-            adjacent = [tokens[i].value for i in (index - 1, index + 1) if 0 <= i < len(tokens)]
-            if any(v in {"===", "==", "!==", "!="} for v in adjacent):
-                return True
-    return bool(re.search(r"\.(?:includes|indexOf|some|every|test|match)\s*\(", context))
+    """Require the same syntax evidence as static checks, even if a model says yes."""
+    from .js_parser import candidates
+    return any(candidate.value == value and offset <= candidate.offset < offset + len(quote)
+               for candidate, _, _ in candidates(source, limit=4096, include_password_assignments=True))
 
 
 class LocalAnalyzer:
@@ -198,6 +190,8 @@ class LocalAnalyzer:
                     if not isinstance(items, list):
                         raise ValueError("Invalid model findings")
                     self.completed += 1
+                    from .js_parser import candidates
+                    syntax_candidates = candidates(chunk, limit=4096, include_password_assignments=True)
                     for item in items[:32]:
                         if not isinstance(item, dict):
                             continue
@@ -212,8 +206,11 @@ class LocalAnalyzer:
                         quote, quote_offset = grounded
                         literals = {literal([Token(m.group(), m.lastgroup or "symbol", m.start())])
                                     for m in LEXER.finditer(quote) if m.lastgroup in {"string", "number"}}
-                        if value not in literals or (url, value) in self.seen or not control_context(chunk, quote, quote_offset, value):
+                        candidate = next((c for c, _, _ in syntax_candidates if c.value == value
+                                          and quote_offset <= c.offset < quote_offset + len(quote)), None)
+                        if value not in literals or (url, value) in self.seen or candidate is None:
                             continue
+                        kind = "password" if candidate.password else "access_code"
                         self.seen.add((url, value))
                         line = base_line + source.count("\n", 0, start + quote_offset) + 1
                         findings.append(Finding("Critical" if kind == "password" else "Warning", "Local AI", "Model-assisted access-control candidate", safe_url(url),
