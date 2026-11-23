@@ -15,6 +15,8 @@ and leave visibility **Private**. Open the forwarded HTTPS URL printed by gilbrt
 The GUI recognizes only this codespace's exact forwarded hostname using GitHub's
 `CODESPACE_NAME` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN` environment variables.
 Other forwarded hostnames/origins are rejected; API session tokens remain required.
+Codespaces may independently rewrite Host or Origin to the exact HTTP loopback
+address and port; those upstream values are accepted alongside the forwarded origin.
 No local browser is launched inside Codespaces. The forwarded port protocol should
 remain **HTTP** because the upstream Python server serves HTTP; GitHub provides
 HTTPS for the browser-facing URL. Do not publish the port: authentication for remote

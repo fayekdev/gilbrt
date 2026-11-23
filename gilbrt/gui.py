@@ -270,11 +270,11 @@ class GUIHandler(BaseHTTPRequestHandler):
         if self.headers.get("Sec-Fetch-Site") == "cross-site" and not document_navigation:
             raise APIError("Cross-site requests are not allowed.", 403)
         origin = self.headers.get("Origin")
-        # Some proxies preserve Host, others rewrite it to the loopback upstream.
-        # Both cases require the exact known origin; no forwarding headers are trusted.
-        expected_origins = (self.server.allowed_origins if host in {urlsplit(item).netloc for item in self.server.local_origins}
-                            else {self.server.forwarded_origin})
-        if origin and origin not in expected_origins:
+        # Codespaces can rewrite Origin to the HTTP loopback upstream while
+        # preserving the external Host (or rewrite Host while preserving Origin).
+        # These independent rewrites still require an exact known origin/port.
+        # No request-supplied forwarding header can expand this allowlist.
+        if origin and origin not in self.server.allowed_origins:
             raise APIError("Invalid local origin.", 403)
         if token and not secrets.compare_digest(self.headers.get("X-Gilbrt-Token", ""), self.server.state.token):
             raise APIError("Reload the GUI to restore the local session.", 403)

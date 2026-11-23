@@ -152,12 +152,32 @@ class GUITests(unittest.TestCase):
         for bad_host in (host.replace("my-test-space", "another-space"),host+".attacker.example",
                          "attacker.example",host.replace(str(self.server.server_port),"1")):
             self.assertEqual(self.session.get(self.base+"/api/bootstrap", headers={"Host":bad_host}).status_code, 403)
-        for bad_origin in ("https://another-space.app.github.dev", "null", "http://"+host, self.base):
+        for bad_origin in ("https://another-space.app.github.dev", "null", "http://"+host,
+                           "http://localhost:1", "http://127.0.0.1:1"):
             self.assertEqual(self.session.post(self.base+"/api/settings", headers={"Host":host,"Origin":bad_origin}, json={}).status_code, 403)
         self.assertEqual(self.session.get(self.base+"/api/state", headers={"Host":host,"Origin":origin,"X-Gilbrt-Token":"wrong"}).status_code, 403)
         self.assertEqual(self.session.get(self.base+"/api/bootstrap", headers={"Host":host,"Sec-Fetch-Site":"cross-site"}).status_code, 403)
         # Forged forwarding headers cannot add an origin to the allowlist.
         self.assertEqual(self.session.get(self.base+"/api/bootstrap", headers={"Host":"attacker.example","X-Forwarded-Host":host,"X-Forwarded-Proto":"https"}).status_code, 403)
+
+    def test_codespaces_independent_host_and_origin_rewrites(self):
+        origin = self.configure_codespaces()
+        # Codespaces may independently preserve or rewrite each header. Exercise
+        # bootstrap and POSTs, not just static assets, across every exact pairing.
+        hosts = [origin.removeprefix("https://"), self.base.removeprefix("http://"),
+                 f"localhost:{self.server.server_port}"]
+        origins = [origin, self.base, f"http://localhost:{self.server.server_port}"]
+        for host in hosts:
+            for browser_origin in origins:
+                with self.subTest(host=host, origin=browser_origin):
+                    headers = {"Host":host, "Origin":browser_origin,"Sec-Fetch-Site":"same-origin"}
+                    self.assertEqual(self.session.get(self.base+"/api/bootstrap",headers=headers).status_code, 200)
+                    self.assertEqual(self.session.post(self.base+"/api/settings",headers=headers,json={"max_pages":9}).status_code, 200)
+                    self.assertEqual(self.session.post(self.base+"/api/settings",headers={**headers,"X-Gilbrt-Token":"wrong"},json={}).status_code, 403)
+                    self.assertEqual(self.session.post(self.base+"/api/settings",headers={**headers,"Sec-Fetch-Site":"cross-site"},json={}).status_code, 403)
+        self.session.headers.update({"Host":hosts[0],"Origin":origins[2],"Sec-Fetch-Site":"same-origin"})
+        self.assertEqual(self.start().status_code, 202)
+        self.assertEqual(self.finish()["job"]["status"], "complete")
 
     def test_codespaces_document_navigation_from_editor(self):
         origin = self.configure_codespaces()
