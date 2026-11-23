@@ -12,7 +12,7 @@ from unittest.mock import patch
 import requests
 
 from gilbrt.cli import AuditCancelled
-from gilbrt.gui import APIError, DEFAULT_SETTINGS, GUIState, GUIServer, discover_models, validate_settings
+from gilbrt.gui import APIError, DEFAULT_SETTINGS, GUIState, GUIServer, codespaces_origin, discover_models, validate_settings
 
 FIXTURE_PASSWORD = "synthetic-local-fixture-password-908172"
 
@@ -123,6 +123,59 @@ class GUITests(unittest.TestCase):
         self.assertEqual(self.session.post(self.base+"/api/settings", json={}, headers={"X-Gilbrt-Token":"wrong"}).status_code, 403)
         self.assertEqual(self.session.get(self.base+"/gui.py").status_code, 404)
         self.assertEqual(self.session.get(self.base+"/").status_code, 200)
+
+    def configure_codespaces(self):
+        with patch.dict("os.environ", {"CODESPACES":"true", "CODESPACE_NAME":"my-test-space",
+                                      "GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN":"app.github.dev"}):
+            origin = codespaces_origin(self.server.server_port)
+        self.server.forwarded_origin = origin
+        self.server.allowed_origins.add(origin)
+        return origin
+
+    def test_codespaces_bootstrap_settings_and_real_audit(self):
+        origin = self.configure_codespaces()
+        self.session.headers.update({"Host": origin.removeprefix("https://"), "Origin": origin,
+                                     "Sec-Fetch-Site":"same-origin"})
+        bootstrap = self.session.get(self.base+"/api/bootstrap")
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(bootstrap.json()["token"], self.state.token)
+        self.assertEqual(self.session.post(self.base+"/api/settings", json={"max_pages":7}).status_code, 200)
+        self.assertEqual(self.start().status_code, 202)
+        self.assertEqual(self.finish()["job"]["status"], "complete")
+        # A proxy may rewrite Host to loopback while preserving browser Origin.
+        self.assertEqual(self.session.get(self.base+"/api/state", headers={"Host":self.base.removeprefix("http://")}).status_code, 200)
+        self.assertEqual(self.session.get(self.base+"/api/state", headers={"Host":f"localhost:{self.server.server_port}"}).status_code, 200)
+
+    def test_codespaces_rejects_other_spaces_origins_and_missing_token(self):
+        origin = self.configure_codespaces()
+        host = origin.removeprefix("https://")
+        for bad_host in (host.replace("my-test-space", "another-space"),host+".attacker.example",
+                         "attacker.example",host.replace(str(self.server.server_port),"1")):
+            self.assertEqual(self.session.get(self.base+"/api/bootstrap", headers={"Host":bad_host}).status_code, 403)
+        for bad_origin in ("https://another-space.app.github.dev", "null", "http://"+host, self.base):
+            self.assertEqual(self.session.post(self.base+"/api/settings", headers={"Host":host,"Origin":bad_origin}, json={}).status_code, 403)
+        self.assertEqual(self.session.get(self.base+"/api/state", headers={"Host":host,"Origin":origin,"X-Gilbrt-Token":"wrong"}).status_code, 403)
+        self.assertEqual(self.session.get(self.base+"/api/bootstrap", headers={"Host":host,"Sec-Fetch-Site":"cross-site"}).status_code, 403)
+        # Forged forwarding headers cannot add an origin to the allowlist.
+        self.assertEqual(self.session.get(self.base+"/api/bootstrap", headers={"Host":"attacker.example","X-Forwarded-Host":host,"X-Forwarded-Proto":"https"}).status_code, 403)
+
+    def test_codespaces_document_navigation_from_editor(self):
+        origin = self.configure_codespaces()
+        headers = {"Host":origin.removeprefix("https://"),"Sec-Fetch-Site":"cross-site","Sec-Fetch-Mode":"navigate"}
+        self.assertEqual(self.session.get(self.base+"/",headers=headers).status_code, 200)
+        self.assertEqual(self.session.get(self.base+"/api/bootstrap",headers=headers).status_code, 403)
+
+    def test_codespaces_environment_validation(self):
+        environment = {"CODESPACES":"true", "CODESPACE_NAME":"my-test-space",
+                       "GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN":"app.github.dev"}
+        with patch.dict("os.environ", environment):
+            self.assertEqual(codespaces_origin(4174), "https://my-test-space-4174.app.github.dev")
+            for changes in ({"CODESPACES":"false"}, {"CODESPACE_NAME":""},
+                            {"CODESPACE_NAME":"bad/path"}, {"GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN":"app.github.dev/path"},
+                            {"GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN":"app.github.dev:443"},
+                            {"GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN":""}):
+                with patch.dict("os.environ", changes):
+                    self.assertIsNone(codespaces_origin(4174))
 
     def test_settings_persist_without_targets_or_reports(self):
         settings = {**DEFAULT_SETTINGS, "max_pages": 8, "ai_max_chunks": 3, "checks": ["headers"], "model":"bundled"}

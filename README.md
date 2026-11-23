@@ -10,6 +10,16 @@ From this checkout in PowerShell: `.\.venv\Scripts\python.exe -m gilbrt --gui`.
 The server listens only on `http://127.0.0.1:4174`; use `--gui-port 4175` if that
 port is occupied. Keep the terminal running and use Ctrl+C to stop it.
 
+In **GitHub Codespaces**, run `gilbrt --gui`, forward its port in the **Ports** tab,
+and leave visibility **Private**. Open the forwarded HTTPS URL printed by gilbrt.
+The GUI recognizes only this codespace's exact forwarded hostname using GitHub's
+`CODESPACE_NAME` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN` environment variables.
+Other forwarded hostnames/origins are rejected; API session tokens remain required.
+No local browser is launched inside Codespaces. The forwarded port protocol should
+remain **HTTP** because the upstream Python server serves HTTP; GitHub provides
+HTTPS for the browser-facing URL. Do not publish the port: authentication for remote
+access is provided by Codespaces' private forwarding.
+
 The GUI runs the same audit engine as the CLI. Start an authorized audit, select
 checks and an optional installed local model, view live stages and resource counts,
 inspect/filter redacted findings, review coverage, and export JSON, HTML, CSV or AI

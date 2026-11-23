@@ -1,4 +1,4 @@
-"""Loopback-only graphical interface for the shared gilbrt audit engine."""
+"""Loopback-bound GUI with exact local and Codespaces origin validation."""
 
 import copy
 import json
@@ -219,6 +219,25 @@ class GUIState:
                 self.job.update(status="cancelling", stage="Stopping after the current network or inference call")
 
 
+def codespaces_origin(port):
+    """Derive one exact forwarded origin from GitHub's Codespaces environment.
+
+    Never trust request-supplied forwarding headers or a wildcard domain. Private
+    forwarded-port access is authenticated by Codespaces, outside this server.
+    """
+    if os.environ.get("CODESPACES") != "true":
+        return None
+    name = os.environ.get("CODESPACE_NAME", "")
+    domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "")
+    host = f"{name}-{port}.{domain}"
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if (not name or not domain or "." not in domain or len(host) > 253
+            or not re.fullmatch(label, name)
+            or any(not re.fullmatch(label, item) for item in host.split("."))):
+        return None
+    return f"https://{host}"
+
+
 class GUIServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -226,6 +245,11 @@ class GUIServer(ThreadingHTTPServer):
         self.state = state or GUIState()
         super().__init__(("127.0.0.1", port), GUIHandler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
+        self.local_origins = {self.origin, f"http://localhost:{self.server_port}"}
+        self.forwarded_origin = codespaces_origin(self.server_port)
+        self.allowed_origins = set(self.local_origins)
+        if self.forwarded_origin:
+            self.allowed_origins.add(self.forwarded_origin)
 
 
 class GUIHandler(BaseHTTPRequestHandler):
@@ -235,12 +259,22 @@ class GUIHandler(BaseHTTPRequestHandler):
         pass
 
     def _guard(self, token=True):
-        if self.headers.get("Host") != urlsplit(self.server.origin).netloc:
+        host = self.headers.get("Host")
+        allowed_hosts = {urlsplit(origin).netloc for origin in self.server.allowed_origins}
+        if len(self.headers.get_all("Host", [])) != 1 or host not in allowed_hosts:
             raise APIError("Invalid local host.", 403)
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+        # Opening the UI from a Codespaces link is a safe document navigation.
+        # Cross-site API fetches, including bootstrap, are still denied.
+        document_navigation = (self.command == "GET" and urlsplit(self.path).path in {"/", "/index.html"}
+                               and self.headers.get("Sec-Fetch-Mode") == "navigate")
+        if self.headers.get("Sec-Fetch-Site") == "cross-site" and not document_navigation:
             raise APIError("Cross-site requests are not allowed.", 403)
         origin = self.headers.get("Origin")
-        if origin and origin != self.server.origin:
+        # Some proxies preserve Host, others rewrite it to the loopback upstream.
+        # Both cases require the exact known origin; no forwarding headers are trusted.
+        expected_origins = (self.server.allowed_origins if host in {urlsplit(item).netloc for item in self.server.local_origins}
+                            else {self.server.forwarded_origin})
+        if origin and origin not in expected_origins:
             raise APIError("Invalid local origin.", 403)
         if token and not secrets.compare_digest(self.headers.get("X-Gilbrt-Token", ""), self.server.state.token):
             raise APIError("Reload the GUI to restore the local session.", 403)
@@ -339,7 +373,9 @@ def serve(port=4174, open_browser=True):
         print("GUI port is unavailable. Choose another with --gui-port.")
         return 1
     print(f"gilbrt GUI: {server.origin} (local only; Ctrl+C to stop)", flush=True)
-    if open_browser:
+    if server.forwarded_origin:
+        print(f"Codespaces GUI: {server.forwarded_origin} (keep port visibility Private)", flush=True)
+    if open_browser and os.environ.get("CODESPACES") != "true":
         webbrowser.open(server.origin)
     try:
         server.serve_forever(poll_interval=.25)
