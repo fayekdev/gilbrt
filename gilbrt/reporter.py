@@ -4,6 +4,10 @@ import csv
 import html
 import json
 import re
+import shutil
+import subprocess
+import sys
+from io import StringIO
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,7 +45,8 @@ def print_summary(findings: list[Finding], console: Console, visible_values: dic
     paired = list(zip(ordered, rows(ordered)))
     for severity in SEVERITIES:
         selected = [(finding, row) for finding, row in paired if row["severity"] == severity]
-        table = Table(title=f"{severity} ({len(selected)})", title_style=colors[severity])
+        table = Table(title=f"{severity} ({len(selected)})", title_style=colors[severity],
+                      row_styles=("", "on grey11"), border_style=colors[severity])
         for column in ("Finding", "Resource", "Evidence", "Remediation"):
             table.add_column(column, overflow="fold")
         from rich.text import Text
@@ -56,22 +61,21 @@ def print_summary(findings: list[Finding], console: Console, visible_values: dic
         console.print(table)
 
 
-def export(findings: list[Finding], filename: str, fmt: str, metadata: dict) -> None:
-    """Export sanitized data, neutralizing spreadsheet formulas and HTML markup."""
-    path = Path(filename)
+def render_report(findings: list[Finding], fmt: str, metadata: dict) -> str:
+    """Build one sanitized report for file export or an explicit clipboard copy."""
     data = rows(findings)
     document = {"tool": "gilbrt", "generated_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": metadata, "findings": data,
                 "limitations": "Heuristic, bounded audit; absence of findings is not proof of security.",
                 "attribution": "Have I Been Pwned: https://haveibeenpwned.com/ (if queried)"}
     if fmt == "json":
-        path.write_text(json.dumps(document, indent=2, ensure_ascii=True), encoding="utf-8")
+        return json.dumps(document, indent=2, ensure_ascii=True)
     elif fmt == "ai":
         counts = {severity: sum(row["severity"] == severity for row in data) for severity in SEVERITIES}
         # A fenced JSON document preserves exact fields without interpreting site content as Markdown.
         serialized = json.dumps({**document, "summary": counts}, indent=2, ensure_ascii=True)
         fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", serialized)), default=3))
-        path.write_text(
+        return (
             "# gilbrt — AI review report\n\n"
             "## Review task\n\n"
             "Review this authorized security audit. Prioritize findings by severity, distinguish candidates "
@@ -89,30 +93,57 @@ def export(findings: list[Finding], filename: str, fmt: str, metadata: dict) -> 
             "1. List the highest-priority issues and supporting observations.\n"
             "2. Propose remediation for each issue, including likely implementation locations.\n"
             "3. Identify uncertainties, false-positive checks and coverage gaps.\n"
-            "4. Give a safe retest plan using synthetic data and authorized test accounts.\n",
-            encoding="utf-8")
+            "4. Give a safe retest plan using synthetic data and authorized test accounts.\n"
+        )
     elif fmt == "csv":
         fields = list(Finding.__dataclass_fields__)
-        with path.open("w", newline="", encoding="utf-8-sig") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fields)
-            writer.writeheader()
-            for row in data:
-                writer.writerow({k: "'" + v if v.lstrip().startswith(("=", "+", "-", "@")) else v
-                                 for k, v in row.items()})
+        stream = StringIO(newline="")
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in data:
+            writer.writerow({k: "'" + v if v.lstrip().startswith(("=", "+", "-", "@")) else v
+                             for k, v in row.items()})
+        return stream.getvalue()
     elif fmt == "html":
         fields = list(Finding.__dataclass_fields__)
         headers = "".join(f"<th>{html.escape(k)}</th>" for k in fields)
         body = "".join("<tr>" + "".join(f"<td>{html.escape(row[k])}</td>" for k in fields) + "</tr>" for row in data)
-        path.write_text(
+        return (
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; style-src &#39;unsafe-inline&#39;">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>gilbrt report</title>'
             '<style>body{font:15px system-ui;margin:2rem;background:#f7f9fc;color:#172338}'
             'table{border-collapse:collapse;width:100%;background:white}td,th{border:1px solid #cad2df;padding:10px;text-align:left;overflow-wrap:anywhere}'
-            'th{background:#dfe9f5}pre{white-space:pre-wrap}</style></head><body><h1>gilbrt security audit</h1>'
+            'th{background:#dfe9f5}tbody tr:nth-child(even){background:#e8eef7}tbody tr:hover{background:#fff2b3}pre{white-space:pre-wrap}</style></head><body><h1>gilbrt security audit</h1>'
             f'<pre>{html.escape(json.dumps(metadata, indent=2))}</pre><table><thead><tr>{headers}</tr></thead><tbody>{body}</tbody></table>'
             '<p>Heuristic, bounded audit. Absence of findings does not establish security.</p>'
-            '<p>Breach data, if queried: <a href="https://haveibeenpwned.com/">Have I Been Pwned</a>.</p></body></html>',
-            encoding="utf-8")
+            '<p>Breach data, if queried: <a href="https://haveibeenpwned.com/">Have I Been Pwned</a>.</p></body></html>'
+        )
     else:
         raise ValueError("Unsupported report format")
+
+
+def export(findings: list[Finding], filename: str, fmt: str, metadata: dict) -> None:
+    """Export sanitized data, neutralizing spreadsheet formulas and HTML markup."""
+    text = render_report(findings, fmt, metadata)
+    Path(filename).write_text(text, encoding="utf-8-sig" if fmt == "csv" else "utf-8")
+
+
+def copy_to_clipboard(text: str) -> None:
+    """Copy sanitized report text using an available native clipboard command."""
+    candidates = (["clip.exe"] if sys.platform == "win32" else
+                  [["pbcopy"]] if sys.platform == "darwin" else
+                  [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]])
+    if sys.platform == "win32":
+        commands = [candidates]
+    else:
+        commands = candidates
+    command = next((item for item in commands if shutil.which(item[0])), None)
+    if not command:
+        raise OSError("No supported clipboard command is available")
+    try:
+        completed = subprocess.run(command, input=text, text=True, capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise OSError("Clipboard command failed") from error
+    if completed.returncode:
+        raise OSError("Clipboard command failed")

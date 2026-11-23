@@ -17,8 +17,8 @@ git() {
   printf '%s\n' '[project]' 'name = "gilbrt"' > "$6/pyproject.toml"
 }
 export -f uname python3 git
-bash "$script" --with-ai --add-path --prefix "$fixture/prefix" > "$fixture/output"
-[[ "$(cat "$fixture/receipt")" == "$(printf '%s\n' --with-ai --add-path --prefix "$fixture/prefix")" ]]
+bash "$script" --ai-model bundled --add-path --prefix "$fixture/prefix" > "$fixture/output"
+[[ "$(cat "$fixture/receipt")" == "$(printf '%s\n' --ai-model bundled --add-path --prefix "$fixture/prefix")" ]]
 printf '%s\n' 'PASS: clone and installer argument forwarding'
 if bash "$script" > "$fixture/output" 2>&1; then exit 1; fi
 grep -q 'Destination already exists' "$fixture/output"

@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+from pathlib import Path
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
@@ -18,11 +19,22 @@ from .menu import select_checks
 from .local_ai import LocalAnalyzer
 from .bundled_ai import BundledAnalyzer, available as bundled_available
 from .models import Finding
-from .reporter import export, print_summary
+from .reporter import copy_to_clipboard, export, print_summary, render_report
 from .scanner import CONTENT_CHECKS, safe_url, scan
+from .updater import update_installation
 
-DEFAULT_CHECKS = ["passwords", "api-keys", "tokens", "private-keys", "entropy", "comments", "headers", "tls", "breaches", "access-codes"]
+DEFAULT_CHECKS = ["passwords", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints", "headers", "tls", "breaches", "access-codes"]
 SEARCH_OPTIONS = DEFAULT_CHECKS + ["local-ai"]
+
+
+def installed_model_default() -> str:
+    """Read the installer-selected local model without treating it as code."""
+    path = Path(__file__).resolve().parents[1] / ".runtime" / "default_model.txt"
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        return value if re.fullmatch(r"[A-Za-z0-9._/-]+(?::[A-Za-z0-9._-]+)?|bundled", value) else "bundled"
+    except OSError:
+        return "bundled" if bundled_available() else "qwen2.5-coder:0.5b"
 
 
 def search_selection(value: str) -> set[str]:
@@ -91,6 +103,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--hibp-api-key", default=os.environ.get("HIBP_API_KEY"),
                    help="Optional HIBP catalogue check; prefer HIBP_API_KEY environment variable")
     p.add_argument("--output", help="Report path (may contain sensitive audit metadata)")
+    p.add_argument("--copy-report", action="store_true", help="Copy the complete redacted report to the local clipboard")
     p.add_argument("--format", choices=("json", "csv", "html", "ai"), default=None,
                    help="Report format; ai produces Markdown for AI review (default: json in scripts)")
     p.add_argument("--active", action="store_true", help="Enable explicit synthetic staging probes")
@@ -98,6 +111,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--search", type=search_selection, action="append", metavar="CATEGORIES",
                    help="Comma-separated selection (repeatable): all, " + ", ".join(SEARCH_OPTIONS))
     p.add_argument("--interactive", action="store_true", help="Show the guided flow with selectable checkboxes")
+    p.add_argument("--update", action="store_true", help="Safely fast-forward and reinstall this Git checkout, then exit")
     p.add_argument("--show-secrets", action="store_true",
                    help="Reveal matched values in the local terminal; exports remain redacted")
     p.add_argument("--include-url", action="append", default=[], metavar="PATH_OR_URL",
@@ -126,12 +140,14 @@ def interactive_setup(args: argparse.Namespace, console: Console, selected: set[
         console.print(Text("Selected: " + ", ".join(name for name in SEARCH_OPTIONS if name in selected)))
     if "local-ai" in selected and not args.local_model:
         args.local_model = Prompt.ask("Local model (bundled or an installed Ollama tag)",
-                                     default="bundled" if bundled_available() else "qwen2.5-coder:0.5b", console=console)
+                                     default=installed_model_default(), console=console)
     if not args.output and Confirm.ask("Export a full report?", default=True, console=console):
         args.format = Prompt.ask("Report format (ai = Markdown for AI tools)",
                                  choices=["ai", "json", "html", "csv"], default=args.format or "ai", console=console)
         extension = "md" if args.format == "ai" else args.format
         args.output = Prompt.ask("Report file", default=f"gilbrt-report.{extension}", console=console)
+    if not args.copy_report:
+        args.copy_report = Confirm.ask("Copy the redacted full report to the clipboard?", default=False, console=console)
     if not args.show_secrets:
         args.show_secrets = Confirm.ask("Reveal matched values in this terminal? Exports stay redacted", default=False, console=console)
     if not args.confirm_authorized:
@@ -145,6 +161,15 @@ def main(argv: list[str] | None = None) -> int:
     p = parser()
     arguments = sys.argv[1:] if argv is None else argv
     args = p.parse_args(arguments)
+    if args.update:
+        console = Console()
+        try:
+            message = update_installation()
+            console.print(message, style="green")
+            return 0
+        except (OSError, ValueError):
+            console.print("Update failed. Use a clean Git checkout with network access, or update manually.", style="red")
+            return 1
     args.interactive = args.interactive or not arguments
     console = Console()
     selected = set().union(*args.search) if args.search else set(DEFAULT_CHECKS)
@@ -243,9 +268,7 @@ def main(argv: list[str] | None = None) -> int:
         if resources == 0:
             console.print("No source resources were scanned. This run cannot establish whether passwords or codes are exposed.", style="bold yellow")
         console.print(f"Scanned {resources} resources; {len(findings)} observations. Coverage is bounded.")
-        if args.output:
-            export(findings, args.output, args.format,
-                   {"target": safe_url(target), "resources_scanned": resources, "active": args.active,
+        metadata = {"target": safe_url(target), "resources_scanned": resources, "active": args.active,
                     "robots_respected": not args.ignore_robots, "max_depth": args.max_depth,
                     "max_pages": args.max_pages, "rate_limit_seconds": args.rate_limit,
                     "search_categories": sorted(selected), "resource_inventory": resource_inventory,
@@ -266,8 +289,16 @@ def main(argv: list[str] | None = None) -> int:
                                  "cached_candidate_reviews": getattr(analyzer, "cache_hits", None) if analyzer else None,
                                  "candidate_limit": args.ai_candidate_limit if analyzer and args.local_model == "bundled" else None,
                                  "candidate_limit_reached": getattr(analyzer, "candidate_limit_reached", False) if analyzer else False,
-                                 "runner_peak_rss_bytes": analyzer.memory_bytes() if analyzer and args.local_model == "bundled" else None}})
+                                 "runner_peak_rss_bytes": analyzer.memory_bytes() if analyzer and args.local_model == "bundled" else None}}
+        if args.output:
+            export(findings, args.output, args.format, metadata)
             console.print(Text(f"Full report written: {os.path.abspath(args.output)}", style="green"))
+        if args.copy_report:
+            try:
+                copy_to_clipboard(render_report(findings, args.format, metadata))
+                console.print("Redacted full report copied to the clipboard.", style="green")
+            except OSError:
+                console.print("Clipboard unavailable. Install wl-clipboard/xclip on Linux, or use --output.", style="yellow")
         return 0
     except KeyboardInterrupt:
         console.print("Audit interrupted; no partial report written.", style="yellow")

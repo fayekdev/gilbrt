@@ -117,6 +117,7 @@ def install() -> None:
                 "model_bytes": MODEL_SIZE, "model_revision": REVISION,
                 "source": "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"}
     (DEST / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (DEST / "default_model.txt").write_text("bundled\n", encoding="utf-8")
     print("Small local model installed. Select local-ai and use model name bundled.", flush=True)
 
 

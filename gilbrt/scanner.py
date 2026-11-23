@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Callable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Comment
 
@@ -22,6 +22,19 @@ PATTERNS: dict[str, re.Pattern[str]] = {
     "Stripe live secret": re.compile(r"\bsk_live_[0-9A-Za-z]{16,}\b"),
     "Slack token": re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
     "GitHub token": re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    "GitLab token": re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    "npm token": re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b"),
+    "PyPI token": re.compile(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{20,}\b"),
+    "SendGrid API key": re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{20,}\b"),
+    "Twilio API key": re.compile(r"\bSK[0-9a-fA-F]{32}\b"),
+    "Mailgun API key": re.compile(r"\bkey-[0-9a-zA-Z]{32}\b"),
+    "Supabase access token": re.compile(r"\bsbp_[A-Za-z0-9_-]{20,}\b"),
+    "Supabase secret key": re.compile(r"\bsb_secret_[A-Za-z0-9_-]{20,}\b"),
+    "DigitalOcean token": re.compile(r"\bdop_v1_[0-9a-fA-F]{64}\b"),
+    "Postman API key": re.compile(r"\bPMAK-[A-Za-z0-9_-]{20,}\b"),
+    "Linear API key": re.compile(r"\blin_api_[A-Za-z0-9]{20,}\b"),
+    "Sentry auth token": re.compile(r"\bsntrys_[A-Za-z0-9_-]{20,}\b"),
+    "Discord webhook": re.compile(r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9._-]+"),
     "JWT": re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
     "Private key": re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"),
 }
@@ -29,7 +42,7 @@ ASSIGNMENT = re.compile(
     r'''(?ix)["']?\b(?:api[_-]?key|secret|token|password|auth)\b["']?\s*[:=]\s*["']([^"'\r\n]{8,512})["']'''
 )
 KEYWORDS = re.compile(r"\b(?:TODO|FIXME|password|secret|debug|internal|admin)\b", re.I)
-CONTENT_CHECKS = {"passwords", "access-codes", "api-keys", "tokens", "private-keys", "entropy", "comments"}
+CONTENT_CHECKS = {"passwords", "access-codes", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints"}
 PASSWORD = re.compile(
     r'''(?ix)(?<![\w$.-])["']?(?:[\w$.-]*?(?:password|passwd|pwd)|pass)["']?\s*(?::|=(?!=))\s*(?:"([^"\r\n]{1,512})"|'([^'\r\n]{1,512})'|`([^`\r\n]{1,512})`|([^\s,;<>"'`}{]{1,512}))'''
 )
@@ -39,7 +52,9 @@ def pattern_category(label: str) -> str:
     """Map provider patterns to selectable content checks."""
     if label == "Private key":
         return "private-keys"
-    if label in {"Slack token", "GitHub token", "JWT", "Hugging Face token"}:
+    if label in {"Slack token", "GitHub token", "GitLab token", "npm token", "PyPI token",
+                 "JWT", "Hugging Face token", "Supabase access token", "DigitalOcean token",
+                 "Postman API key", "Linear API key", "Sentry auth token"}:
         return "tokens"
     return "api-keys"
 
@@ -72,6 +87,52 @@ def safe_url(url: str) -> str:
         return "[URL omitted]"
 
 
+ENDPOINT_CALL = re.compile(
+    r'''(?ix)(?:\bfetch|\baxios(?:\.(?:get|post|put|patch|delete))?|\bWebSocket|\bEventSource|'''
+    r'''\bnavigator\.sendBeacon|\.open)\s*\(\s*(?:(?:["'](?:GET|POST|PUT|PATCH|DELETE)["'])\s*,\s*)?'''
+    r'''["'`]((?:https?:|wss?:)?//[^"'`\s]+|/[^"'`\s]{1,500})["'`]''')
+ENDPOINT_CONFIG = re.compile(
+    r'''(?ix)["']?(?:api[_-]?(?:url|endpoint|base)|base[_-]?url|graphql[_-]?(?:url|endpoint)|'''
+    r'''supabase[_-]?url|websocket[_-]?url)["']?\s*[:=]\s*["'`]([^"'`\r\n]{1,500})["'`]''')
+SUPABASE_URL = re.compile(r"https://[a-z0-9]{8,32}\.supabase\.co\b", re.I)
+ENDPOINT_LITERAL = re.compile(r'''["'`]((?:/api(?:/|\b)|/graphql\b|/rpc/|/openapi(?:\.json)?\b|/swagger(?:\.json)?\b)[^"'`\s]{0,480})["'`]''', re.I)
+SUPABASE_SERVICE_ROLE = re.compile(
+    r'''(?ix)(?:supabase[_-]?)?service[_-]?role(?:[_-]?key)?["']?\s*[:=]\s*["'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)["']''')
+
+
+def detect_endpoints(text: str, source_url: str) -> list[Finding]:
+    """Inventory endpoint literals already exposed in source without requesting them."""
+    location = safe_url(source_url)
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    matches = [(m.start(), m.group(), "Supabase project URL") for m in SUPABASE_URL.finditer(text)]
+    matches += [(m.start(1), m.group(1), "client call") for m in ENDPOINT_CALL.finditer(text)]
+    matches += [(m.start(1), m.group(1), "API configuration") for m in ENDPOINT_CONFIG.finditer(text)]
+    matches += [(m.start(1), m.group(1), "API route literal") for m in ENDPOINT_LITERAL.finditer(text)]
+    source = urlsplit(source_url)
+    for offset, raw, kind in matches:
+        try:
+            endpoint = urljoin(source_url, raw.replace("ws://", "http://").replace("wss://", "https://"))
+            parsed = urlsplit(endpoint)
+        except ValueError:
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        canonical = urlunsplit((parsed.scheme, parsed.netloc.lower(), parsed.path or "/", "", ""))
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        same_origin = (parsed.scheme, parsed.netloc.lower()) == (source.scheme, source.netloc.lower())
+        exposure = "same-origin" if same_origin else "third-party"
+        findings.append(Finding(
+            "Warning" if kind == "Supabase project URL" else "Info", "Endpoint", "Exposed client-side endpoint reference",
+            safe_url(canonical),
+            f"Line {text.count(chr(10), 0, offset) + 1}; {kind}; {exposure}; source {location}; endpoint value withheld",
+            "Confirm the endpoint is intentionally public, requires server-side authorization, enforces least privilege and does not trust client-side checks.",
+        ))
+    return findings
+
+
 def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None,
          on_secret: Callable[[Finding, str], None] | None = None) -> list[Finding]:
     """Scan content without persisting raw snippets, comments, or key material."""
@@ -79,6 +140,8 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
     enabled = CONTENT_CHECKS if checks is None else checks
     seen: set[tuple[str, str]] = set()
     location = safe_url(url)
+    if "endpoints" in enabled:
+        findings.extend(detect_endpoints(text, url))
     if enabled & {"passwords", "access-codes"}:
         # HTML can contain megabytes of encoded images. Lex only script contents
         # and event handlers; preserve offsets for script line reporting.
@@ -142,6 +205,17 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                 cells = row.find_all(["td", "th"], recursive=False)
                 if len(cells) >= 2 and re.fullmatch(r"(?:[\w.-]*?(?:password|passwd|pwd)|pass)\s*:?", cells[0].get_text(strip=True), re.I):
                     password_candidate(cells[1].get_text(strip=True), row.sourceline or 1, "HTML table password field")
+    if "api-keys" in enabled or "tokens" in enabled:
+        for match in SUPABASE_SERVICE_ROLE.finditer(text):
+            value = match.group(1)
+            if ("JWT", value) in seen:
+                continue
+            seen.add(("JWT", value))
+            findings.append(Finding("Critical", "Secret", "Potential Supabase service-role key", location,
+                                    f"Line {text.count(chr(10), 0, match.start(1)) + 1}; {mask(value)}; semantic static match only",
+                                    "Rotate the key immediately if real; service-role keys bypass row-level security and must never be shipped to clients."))
+            if on_secret:
+                on_secret(findings[-1], value)
     for label, pattern in PATTERNS.items():
         if pattern_category(label) not in enabled:
             continue

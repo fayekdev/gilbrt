@@ -1,6 +1,7 @@
 const repo = 'https://github.com/fayekdev/gilbrt';
 const tabs = [...document.querySelectorAll('[data-os]')];
 const ai = document.querySelector('#with-ai');
+const aiModel = document.querySelector('#ai-model');
 const code = document.querySelector('#install-code');
 const note = document.querySelector('#install-note');
 const shell = document.querySelector('#shell-label');
@@ -12,8 +13,9 @@ function renderInstall() {
   const windows = selected === 'windows';
   const mac = selected === 'macos';
   ai.disabled = mac;
+  aiModel.disabled = mac || !ai.checked;
   if (mac) ai.checked = false;
-  const extra = ai.checked ? ' --with-ai' : '';
+  const extra = ai.checked ? ` --ai-model ${aiModel.value}` : '';
   tabs.forEach(tab => {
     const active = tab.dataset.os === selected;
     tab.setAttribute('aria-selected', String(active));
@@ -22,7 +24,7 @@ function renderInstall() {
   document.querySelector('#install-content').setAttribute('aria-labelledby', `tab-${selected}`);
   shell.textContent = windows ? 'POWERSHELL' : 'BASH';
   code.textContent = windows
-    ? `git clone ${repo}.git\ncd gilbrt\npy -3 -m venv .venv\n.\\.venv\\Scripts\\python.exe -m pip install -e .${ai.checked ? '\n.\\.venv\\Scripts\\python.exe scripts/install_small_ai.py' : ''}\n.\\.venv\\Scripts\\gilbrt.exe`
+    ? `git clone ${repo}.git\ncd gilbrt\npy -3 -m venv .venv\n.\\.venv\\Scripts\\python.exe -m pip install -e .${ai.checked ? (aiModel.value === 'bundled' ? '\n.\\.venv\\Scripts\\python.exe scripts/install_small_ai.py' : '\nollama pull qwen2.5-coder:0.5b') : ''}\n.\\.venv\\Scripts\\gilbrt.exe`
     : `curl -fsSL ${quote(`${location.origin}/install.sh`)} -o /tmp/gilbrt-install.sh\nbash /tmp/gilbrt-install.sh --add-path${extra}\nexport PATH="$HOME/.local/bin:$PATH"\ngilbrt`;
   note.textContent = mac
     ? 'Requires Git and Python 3.10+. Static checks use the Python CLI; the bundled AI runtime is not available for macOS. macOS execution has not been verified.'
@@ -44,6 +46,7 @@ tabs.forEach((tab, index) => {
   });
 });
 ai.addEventListener('change', renderInstall);
+aiModel.addEventListener('change', renderInstall);
 copy.addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(code.textContent);

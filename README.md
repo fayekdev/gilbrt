@@ -14,7 +14,8 @@ gilbrt
 ```
 
 This installs a normal `gilbrt` terminal command. Add `--with-ai` on a new machine
-to explicitly install the small model. Your current checkout already has it.
+to choose a local model interactively, or use `--ai-model bundled` for the low-RAM
+Qwen2.5-Coder 0.5B model and `--ai-model ollama:qwen2.5-coder:0.5b` for Ollama.
 The command opens the website field, checkboxes, export and authorization flow.
 For the installed small model with visible local values:
 
@@ -53,7 +54,8 @@ PowerShell environment in this project, run:
 ```
 
 The wizard asks for the website URL, search categories, whether to export a full
-report, report format/path, local secret-reveal preference, and authorization.
+report, report format/path, whether to copy the redacted report to the clipboard,
+local secret-reveal preference, and authorization.
 No network requests are made until setup finishes and authorization is confirmed.
 Declining authorization cancels the audit. Ctrl+C cancels setup cleanly. Bare
 invocation requires an interactive terminal; scripts should use explicit flags.
@@ -63,7 +65,9 @@ JavaScript, submits forms, guesses paths, tests credentials, injects SQL/XSS, or
 validates discovered secrets against providers. Source maps are fetched only when
 explicitly referenced by an already fetched same-origin script. No external
 scripts are downloaded. Exact scheme and netloc are enforced at each redirect;
-an HTTP-to-HTTPS redirect therefore needs a separate audit of the HTTPS target.
+endpoint inventory only records references already exposed in fetched source and
+does not request guessed or discovered API paths. An HTTP-to-HTTPS redirect
+therefore needs a separate audit of the HTTPS target.
 
 ## Options
 
@@ -83,6 +87,12 @@ an HTTP-to-HTTPS redirect therefore needs a separate audit of the HTTPS target.
   storing credentials in shell history/process arguments.
 - `--output PATH --format json|csv|html|ai`: save a report; existing output is overwritten.
   `ai` writes a Markdown report designed to attach to or paste into an AI coding tool.
+- `--copy-report`: copy the same complete, redacted report to the local clipboard.
+  Linux requires `wl-copy`, `xclip`, or `xsel`; headless systems can use `--output`.
+- `--update`: update a clean Git installation using a fast-forward-only pull and
+  refresh the editable Python package. It refuses tracked local modifications.
+- `--local-model bundled|TAG`: use the installer-selected bundled model or an
+  installed Ollama model tag. The installer accepts `--ai-model bundled|ollama:TAG`.
 - `--active --active-config FILE`: opt in to explicit staging probes described below.
 
 ## Choose what to search for
@@ -113,7 +123,7 @@ Interactive mode requires a terminal; CLI flags work in scripts and PowerShell.
 ```
 
 Categories: `passwords`, `access-codes`, `api-keys`, `tokens`, `private-keys`, `entropy`, `comments`,
-`headers`, `tls`, `breaches`. Default: `all`. `--search` can be repeated. Selecting
+`endpoints`, `headers`, `tls`, `breaches`. Default: `all`. `--search` can be repeated. Selecting
 `breaches` still requires a HIBP key. Active probes require their separate flags.
 `local-ai` is an additional opt-in checkbox, initially unchecked and excluded from
 the CLI `all` selection. It requires an installed local model.
@@ -182,7 +192,10 @@ The installer uses a per-project virtual environment and installs a per-user
 command into `~/.local/bin` (or `--prefix DIRECTORY`). It refuses to overwrite an
 unrelated existing command. `--add-path` adds an owned block to `.bashrc`, backing
 up an existing file before changes. A fresh Bash home gets a login loader;
-existing login startup files remain unchanged. Omit `--with-ai` for static-only installation. On
+existing login startup files remain unchanged. With a terminal, `--with-ai` asks
+you to choose the bundled low-RAM model or Ollama Qwen 0.5B. For automation, pass
+`--ai-model bundled` or `--ai-model ollama:qwen2.5-coder:0.5b`. Omit AI options
+for static-only installation. On
 Windows, the existing virtual environment works from PowerShell and Git Bash:
 
 ```powershell

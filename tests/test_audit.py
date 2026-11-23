@@ -244,7 +244,7 @@ class AuditTests(unittest.TestCase):
             with patch("gilbrt.cli.sys.stdin.isatty", return_value=True), \
                  patch("gilbrt.cli.Prompt.ask", side_effect=[self.url + "/visible-config.json", "ai", str(filename)]), \
                  patch("gilbrt.cli.select_checks", return_value={"passwords"}), \
-                 patch("gilbrt.cli.Confirm.ask", side_effect=[True, False, True]), \
+                 patch("gilbrt.cli.Confirm.ask", side_effect=[True, False, False, True]), \
                  patch("gilbrt.crawler.ScopedClient.pace"), redirect_stdout(io.StringIO()):
                 self.assertEqual(main([]), 0)
             report = filename.read_text(encoding="utf-8")

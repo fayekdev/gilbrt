@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
-  printf '%s\n' 'Usage: bash install.sh [--with-ai] [--add-path] [--prefix DIRECTORY]' \
+  printf '%s\n' 'Usage: bash install.sh [--with-ai] [--ai-model bundled|ollama:TAG] [--add-path] [--prefix DIRECTORY]' \
     'Requires Git, Python 3.10+ and venv. Installs without sudo.' \
     'GILBRT_SOURCE_URL overrides the Git remote (for authenticated SSH access).' \
     'GILBRT_INSTALL_DIR overrides the new checkout directory.'
@@ -19,6 +19,7 @@ args=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-ai) with_ai=1; shift ;;
+    --ai-model) [[ $# -ge 2 && -n "$2" ]] || { printf '%s\n' '--ai-model requires a value' >&2; exit 2; }; with_ai=1; shift 2 ;;
     --add-path) shift ;;
     --prefix) [[ $# -ge 2 && -n "$2" ]] || { printf '%s\n' '--prefix requires a directory' >&2; exit 2; }; shift 2 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
