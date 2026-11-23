@@ -35,9 +35,21 @@ if [[ ! -x "$environment_dir/$python_suffix" ]]; then
     fi
   done
   [[ -n "$bootstrap_python" ]] || { printf '%s\n' 'Python 3.10+ with venv is required.' >&2; exit 1; }
-  "$bootstrap_python" -m venv "$environment_dir"
+  if ! "$bootstrap_python" -m venv "$environment_dir"; then
+    printf '%s\n' 'Could not create the Python virtual environment.' \
+      'On Debian/Ubuntu, install python3-venv (and the matching version package for a custom Python), then rerun this installer.' >&2
+    exit 1
+  fi
 fi
 environment_python="$environment_dir/$python_suffix"
+if ! "$environment_python" -m pip --version >/dev/null 2>&1; then
+  printf '%s\n' 'Repairing pip in the existing virtual environment…'
+  if ! "$environment_python" -m ensurepip --upgrade; then
+    printf '%s\n' 'This virtual environment has no usable pip/ensurepip.' \
+      'On Debian/Ubuntu, install python3-venv for this Python version, then rerun this installer. The checkout is preserved.' >&2
+    exit 1
+  fi
+fi
 "$environment_python" -m pip install -e "$project_dir"
 if [[ "$with_ai" -eq 1 ]]; then
   "$environment_python" "$project_dir/scripts/install_small_ai.py"

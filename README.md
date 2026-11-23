@@ -29,6 +29,12 @@ Interactive Git Bash sessions automatically use `winpty` when available so the
 native Windows Python checkbox interface receives a real terminal. Linux uses
 its terminal directly.
 
+If Debian/Ubuntu reports that `ensurepip` is unavailable, install the venv package
+matching your Python version (for example `python3.13-venv`). Then run the project
+installer again from its existing checkout. It repairs an existing environment
+that has Python but lacks pip. After a website bootstrap failure, the checkout is
+normally `${XDG_DATA_HOME:-$HOME/.local/share}/gilbrt`; the bootstrap preserves it.
+
 PowerShell remains available:
 
 ```powershell

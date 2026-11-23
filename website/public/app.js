@@ -23,7 +23,7 @@ function renderInstall() {
   shell.textContent = windows ? 'POWERSHELL' : 'BASH';
   code.textContent = windows
     ? `git clone ${repo}.git\ncd gilbrt\npy -3 -m venv .venv\n.\\.venv\\Scripts\\python.exe -m pip install -e .${ai.checked ? '\n.\\.venv\\Scripts\\python.exe scripts/install_small_ai.py' : ''}\n.\\.venv\\Scripts\\gilbrt.exe`
-    : `curl -fsSL ${quote(`${location.origin}/install.sh`)} -o /tmp/gilbrt-install.sh\nbash /tmp/gilbrt-install.sh${extra}\nexport PATH="$HOME/.local/bin:$PATH"\ngilbrt`;
+    : `curl -fsSL ${quote(`${location.origin}/install.sh`)} -o /tmp/gilbrt-install.sh\nbash /tmp/gilbrt-install.sh --add-path${extra}\nexport PATH="$HOME/.local/bin:$PATH"\ngilbrt`;
   note.textContent = mac
     ? 'Requires Git and Python 3.10+. Static checks use the Python CLI; the bundled AI runtime is not available for macOS. macOS execution has not been verified.'
     : windows

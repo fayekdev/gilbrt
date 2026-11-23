@@ -40,6 +40,9 @@ install_dir="${GILBRT_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/gilbrt}"
 [[ "$install_dir" == /* ]] || { printf '%s\n' 'GILBRT_INSTALL_DIR must be an absolute path.' >&2; exit 2; }
 if [[ -e "$install_dir" || -L "$install_dir" ]]; then
   printf 'Destination already exists: %s\nChoose a new GILBRT_INSTALL_DIR or use the existing checkout.\n' "$install_dir" >&2
+  if [[ -f "$install_dir/install.sh" && -f "$install_dir/pyproject.toml" ]]; then
+    printf 'To retry your existing gilbrt checkout without deleting it:\n  bash %q --add-path\n' "$install_dir/install.sh" >&2
+  fi
   exit 1
 fi
 mkdir -p "$(dirname "$install_dir")"

@@ -24,7 +24,7 @@ Open http://127.0.0.1:4173. Run `npm test` for the stats endpoint tests. With Ba
 ```bash
 curl -fsSL https://YOUR-DOMAIN/install.sh -o /tmp/gilbrt-install.sh
 # Inspect the downloaded file if desired.
-bash /tmp/gilbrt-install.sh
+bash /tmp/gilbrt-install.sh --add-path
 export PATH="$HOME/.local/bin:$PATH"
 gilbrt
 ```

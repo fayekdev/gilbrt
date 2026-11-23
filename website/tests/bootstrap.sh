@@ -3,7 +3,7 @@
 set -euo pipefail
 script="$(cd "$(dirname "$0")/../public" && pwd)/install.sh"
 fixture="$(mktemp -d)"
-trap 'rm -f "$fixture/checkout/install.sh" "$fixture/receipt" "$fixture/output"; rmdir "$fixture/checkout" "$fixture" 2>/dev/null || true' EXIT
+trap 'rm -f "$fixture/checkout/install.sh" "$fixture/checkout/pyproject.toml" "$fixture/receipt" "$fixture/output"; rmdir "$fixture/checkout" "$fixture" 2>/dev/null || true' EXIT
 export GILBRT_INSTALL_DIR="$fixture/checkout"
 export BOOTSTRAP_RECEIPT="$fixture/receipt"
 export BOOTSTRAP_PLATFORM=Linux
@@ -14,6 +14,7 @@ git() {
   [[ "$5" == 'https://github.com/fayekdev/gilbrt.git' ]]
   mkdir -p "$6"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$BOOTSTRAP_RECEIPT"' > "$6/install.sh"
+  printf '%s\n' '[project]' 'name = "gilbrt"' > "$6/pyproject.toml"
 }
 export -f uname python3 git
 bash "$script" --with-ai --add-path --prefix "$fixture/prefix" > "$fixture/output"
@@ -21,6 +22,8 @@ bash "$script" --with-ai --add-path --prefix "$fixture/prefix" > "$fixture/outpu
 printf '%s\n' 'PASS: clone and installer argument forwarding'
 if bash "$script" > "$fixture/output" 2>&1; then exit 1; fi
 grep -q 'Destination already exists' "$fixture/output"
+grep -q 'To retry your existing gilbrt checkout' "$fixture/output"
+grep -q -- '--add-path' "$fixture/output"
 printf '%s\n' 'PASS: existing checkout is preserved'
 export BOOTSTRAP_PLATFORM=Darwin
 if bash "$script" --with-ai > "$fixture/output" 2>&1; then exit 1; fi

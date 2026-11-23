@@ -33,6 +33,22 @@ jobs:
           if [[ -x .venv-bash/bin/python ]]; then py=.venv-bash/bin/python; else py=.venv-bash/Scripts/python.exe; fi
           "$py" -m pip check
           "$py" -m unittest discover -s tests -v
+  repair-linux-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Recover a virtual environment left without pip
+        shell: bash
+        run: |
+          python -m venv --without-pip .venv-bash
+          bash install.sh --prefix "$RUNNER_TEMP/gilbrt-repair"
+          (cd "$RUNNER_TEMP" && "$RUNNER_TEMP/gilbrt-repair/bin/gilbrt" --help)
+          .venv-bash/bin/python -m pip check
   website:
     runs-on: ubuntu-latest
     steps:
