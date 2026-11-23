@@ -127,6 +127,7 @@ class Crawler:
         self.client = client
         self.max_depth = max_depth
         self.max_pages = max_pages
+        self.attempts = 0
         self.ignore_robots = ignore_robots
         self.robots: RobotFileParser | None = None
         self.block_all = False
@@ -168,6 +169,7 @@ class Crawler:
             if url in self.visited or not self.permitted(url):
                 continue
             attempts += 1
+            self.attempts = attempts
             self.visited.add(url)
             response = self.client.get(url, self.permitted)
             if response is None:

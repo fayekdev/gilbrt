@@ -3,6 +3,83 @@
 An installable Python 3.10+ CLI for authorized website auditing, static client-side
 secret detection, and opt-in synthetic AI application checks.
 
+## Graphical interface
+
+Run `gilbrt --gui` (or `python -m gilbrt --gui`) to open the local browser interface.
+From this checkout in PowerShell: `.\.venv\Scripts\python.exe -m gilbrt --gui`.
+The server listens only on `http://127.0.0.1:4174`; use `--gui-port 4175` if that
+port is occupied. Keep the terminal running and use Ctrl+C to stop it.
+
+The GUI runs the same audit engine as the CLI. Start an authorized audit, select
+checks and an optional installed local model, view live stages and resource counts,
+inspect/filter redacted findings, review coverage, and export JSON, HTML, CSV or AI
+Markdown. Discovery has no known total, so progress shows stages and actual counts
+instead of an estimated completion percentage. Coverage percentages describe only
+attempted resources, not the entire site. Cancellation waits for an in-flight
+network or inference request, then stops before the next request; previous completed
+results remain available. Active staging probes and raw secret reveal remain CLI
+features.
+
+Open **Settings** to save crawl limits, request pacing, default checks, export
+format, model selection, the loopback Ollama address, AI batch budget, and bundled
+candidate limits. Settings apply to future audits and are saved to
+`GILBRT_RUNTIME/gui-settings.json` (normally `.runtime/gui-settings.json`). Audit
+targets, findings and source bodies are not automatically written to disk. The
+current completed report stays in server memory until replaced or the server stops.
+
+The model dropdown lists the installed bundled CPU model and installed local
+Ollama models; cloud-backed entries are excluded. Use `gilbrt --install-models`
+to install another supported model, then **Refresh models**. Audits never download
+models. The GUI starts with static checks only; explicitly choose a model to use
+local AI. HIBP catalogue checks use `HIBP_API_KEY` from the launch environment,
+when present; the GUI does not store that key.
+
+## Local accuracy benchmark
+
+Run a deliberately vulnerable synthetic website bound only to `127.0.0.1`, audit
+it through the real CLI, and compare findings against predefined ground truth:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.benchmark_demo
+.\.venv\Scripts\python.exe -m scripts.benchmark_demo --with-ai
+.\.venv\Scripts\python.exe -m scripts.benchmark_demo --extended --with-ai --output-dir .runtime/extended-benchmark
+```
+
+On Linux or with an activated environment, use `python -m scripts.benchmark_demo`.
+`--with-ai` uses the already installed bundled model; it does not install a model.
+The temporary server shuts down after the audits. Reports, CLI logs, and per-case
+results are written to `.runtime/demo-benchmark/`; `--output-dir` changes that path.
+
+The original content fixture contains 42 cases (25 exposures and 17 harmless
+controls). `--extended` adds 31 connection, form and browser-code cases, for 73
+content cases (44 intended findings and 29 harmless controls). Both modes include
+15 header cases and four configured synthetic record-isolation checks. Some of
+the extended findings, such as token storage and wildcard messages, require
+contextual review and do not establish an exploitable vulnerability.
+Precision and recall count content cases, not repeated findings. Header and
+isolation outcomes are reported separately. All content resources must be checked
+in `all_case_resources_scanned` before interpreting scores. The runtime-only secret
+is deliberately outside passive discovery and remains in the recall denominator.
+
+On 2026-11-23, the initial implementation detected 21/25 exposure cases and
+flagged 1/17 harmless controls (95.5% precision, 84% recall). After adding bounded
+constant reconstruction, both static scanning and static plus the bundled Qwen
+0.5B model detected 24/25 with the same false alarm (96% precision and recall).
+Concatenated passwords, encoded passwords and a computed gate are now detected.
+The remaining miss is an unlinked runtime-fetched secret. The false alarm is a
+deliberately public, provider-shaped documentation key; token syntax cannot prove
+credential validity. The extended corpus detected 43/44 intended findings with
+1/29 harmless controls flagged (97.7% precision and recall). AI completed without
+errors or budget exhaustion, but added no case detections on either corpus.
+All 15 header cases and four isolation checks passed after the improvements.
+
+These are synthetic development results, not independent certification or an
+estimate of accuracy across arbitrary websites. Provider strings and the private
+key marker are inert detection fixtures, not valid credentials. The benchmark
+does not assess SQL injection, XSS exploitation, real TLS certificates, breach
+catalogues, or actual model prompt-injection resistance. HSTS warnings are excluded
+from header scoring because the demo intentionally uses loopback HTTP.
+
 ## Install and run
 
 From Bash on Linux or Git Bash on Windows:
@@ -149,7 +226,8 @@ Interactive mode requires a terminal; CLI flags work in scripts and PowerShell.
 ```
 
 Categories: `passwords`, `access-codes`, `api-keys`, `tokens`, `private-keys`, `entropy`, `comments`,
-`endpoints`, `headers`, `tls`, `breaches`. Default: `all`. `--search` can be repeated. Selecting
+`endpoints`, `headers`, `tls`, `breaches`, `connections`, `browser-code`, `forms`.
+Default: `all`. `--search` can be repeated. Selecting
 `breaches` still requires a HIBP key. Active probes require their separate flags.
 `local-ai` is an additional opt-in checkbox, initially unchecked and excluded from
 the CLI `all` selection. It requires an installed local model.
@@ -157,13 +235,40 @@ the CLI `all` selection. It requires an installed local model.
 Password checks do not require high entropy: they find literal
 `password`, `passwd`, `pwd`, `pass` and prefixed assignments such as `dbPassword`
 or `DB_PASSWORD`, prefilled password-related HTML fields, and password data
-attributes. JavaScript assignments must contain an actual string or numeric
-literal; variable references, comments and quoted code examples are skipped.
+attributes. JavaScript assignments can contain string/numeric literals or supported
+constant expressions. Bounded reconstruction supports string concatenation,
+literal `atob`, `String.fromCharCode`, literal array `.join`, and eligible earlier
+`const` bindings in the same block. Mutable values, unknown calls, cross-scope
+references, comments and quoted code examples are skipped. Array bindings are
+skipped when another use could mutate or expose the array. Reconstruction has
+size, depth and node limits, and rejects explicit shadows of decoder built-ins.
+It does not execute JavaScript or establish runtime behavior; external monkeypatches
+and complex obfuscation remain outside coverage.
 Visible password fields and plain-text `password: value` fields are also checked.
 HTML tables with a password-labeled first column are also checked. Source-map
 `sourcesContent` is decoded before scanning, including its escaped source text.
 Empty values, explicit placeholders, environment templates and masked values are
 filtered out. Findings remain candidates; values are never tried against a login service.
+
+`connections` detects credential-bearing database, cache, queue and HTTP URLs in
+already fetched content. Connection strings stay masked in reports and are never
+used to connect to a service. `--show-secrets` retains its explicit local reveal
+behavior for these candidates.
+
+`browser-code` uses parsed JavaScript to flag direct browser-controlled values
+such as `location.hash` reaching HTML insertion, `document.write`, or string-code
+execution sinks. It also flags sensitive browser-storage key names and wildcard
+`postMessage` destinations as Info review candidates. It does not infer arbitrary
+data flow or claim XSS exploitability. Unknown calls, including sanitizer calls,
+are outside this direct-flow detector; absence of a finding does not certify them.
+
+`forms` checks password forms for GET submission, HTTP destinations and changes
+of origin, including submit-button overrides. It also checks HTTP resource
+references on HTTPS pages. `headers` additionally reviews CORS policy combinations,
+cache variation, cookie-prefix requirements and version disclosure. CORS, cookie
+and disclosure checks also apply to fetched non-HTML resources, without demanding
+HTML-only browser defenses on JSON or scripts. All new categories are included
+in `all` and the guided checkbox menu.
 
 The `access-codes` check also detects client-side gates such as
 `if (code === "4827")`, `if (pin !== 7392)` and reversed comparisons such as

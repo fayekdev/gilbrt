@@ -13,8 +13,8 @@ from .models import Finding
 from .scanner import safe_url
 
 
-def analyze_headers(response: requests.Response) -> list[Finding]:
-    """Inspect document headers and each Set-Cookie without logging cookie values."""
+def analyze_headers(response: requests.Response, document: bool = True) -> list[Finding]:
+    """Inspect CORS/cookies on all resources; browser document defenses on HTML."""
     findings: list[Finding] = []
     headers = response.headers
     url = safe_url(response.url)
@@ -30,8 +30,8 @@ def analyze_headers(response: requests.Response) -> list[Finding]:
         "Referrer-Policy": "Set strict-origin-when-cross-origin, same-origin, or no-referrer.",
         "Permissions-Policy": "Restrict browser features to the origins that require them.",
     }
-    csp = headers.get("Content-Security-Policy", "")
-    for name, advice in checks.items():
+    csp = headers.get("Content-Security-Policy", "") if document else ""
+    for name, advice in (checks.items() if document else ()):
         if not headers.get(name, "").strip():
             if name == "X-Frame-Options" and re.search(r"(?:^|;)\s*frame-ancestors\s+", csp, re.I):
                 continue
@@ -48,26 +48,40 @@ def analyze_headers(response: requests.Response) -> list[Finding]:
             add("Permissive script CSP", "Broad sources or unsafe execution keywords detected.", checks["Content-Security-Policy"])
         if "script-src" not in directives and "default-src" not in directives:
             add("CSP does not restrict scripts", "No script-src or default-src directive.", checks["Content-Security-Policy"])
-    hsts = headers.get("Strict-Transport-Security", "")
+    hsts = headers.get("Strict-Transport-Security", "") if document else ""
     age = re.search(r"(?:^|;)\s*max-age\s*=\s*(\d+)\s*(?:;|$)", hsts, re.I)
     if hsts and (not age or int(age.group(1)) < 15552000):
         add("Weak HSTS policy", "Missing, invalid or short max-age (<180 days).", checks["Strict-Transport-Security"])
     if hsts and urlsplit(response.url).scheme != "https":
         add("HSTS sent over HTTP", "Browsers do not accept HSTS from insecure HTTP.", checks["Strict-Transport-Security"])
-    xfo = headers.get("X-Frame-Options", "")
+    xfo = headers.get("X-Frame-Options", "") if document else ""
     if xfo and xfo.upper().strip() not in {"DENY", "SAMEORIGIN"}:
         add("Invalid X-Frame-Options", "Value is not DENY or SAMEORIGIN.", checks["X-Frame-Options"])
-    xcto = headers.get("X-Content-Type-Options", "")
+    xcto = headers.get("X-Content-Type-Options", "") if document else ""
     if xcto and xcto.lower().strip() != "nosniff":
         add("Invalid X-Content-Type-Options", "Value is not nosniff.", checks["X-Content-Type-Options"])
-    referrer = headers.get("Referrer-Policy", "")
+    referrer = headers.get("Referrer-Policy", "") if document else ""
     if referrer and referrer.split(",")[-1].strip().lower() not in {
         "no-referrer", "same-origin", "strict-origin", "strict-origin-when-cross-origin"}:
         add("Review Referrer-Policy", "Final policy may disclose more referrer data or be invalid.", checks["Referrer-Policy"])
-    permissions = headers.get("Permissions-Policy", "")
+    permissions = headers.get("Permissions-Policy", "") if document else ""
     if permissions and ("=" not in permissions or re.search(r"=\s*\*", permissions)):
         add("Review Permissions-Policy", "Malformed or wildcard feature policy.", checks["Permissions-Policy"], "Info")
     raw = getattr(response.raw, "headers", None)
+    origin = headers.get("Access-Control-Allow-Origin", "").strip()
+    credentials = headers.get("Access-Control-Allow-Credentials", "").strip().lower()
+    if origin == "*" and credentials == "true":
+        add("Invalid credentialed wildcard CORS", "Wildcard allow-origin combined with allow-credentials=true; browsers reject credentialed reads.",
+            "Use an explicit trusted origin allowlist. This invalid combination alone does not establish cross-origin data exposure.")
+    if origin == "null":
+        add("CORS trusts null origin", "Opaque/sandboxed origins may share the null origin; policy requires review.",
+            "Use an explicit trusted origin allowlist instead of trusting null.")
+    if origin and origin not in {"*", "null"} and "origin" not in {v.strip().lower() for v in headers.get("Vary", "").split(",")} and headers.get("Vary", "").strip() != "*":
+        add("Review CORS cache variation", "Specific allow-origin without Vary: Origin; a static policy may be intentional.",
+            "If allow-origin changes by request origin, send Vary: Origin to prevent shared-cache policy confusion.", "Info")
+    if re.search(r"\b\d+\.\d+(?:\.\d+)?\b", headers.get("Server", "") + " " + headers.get("X-Powered-By", "")):
+        add("Server version disclosed", "A version-like value is present in Server or X-Powered-By; value withheld.",
+            "Remove unnecessary version disclosure and keep server software patched. Disclosure alone does not establish a vulnerable version.", "Info")
     cookies = raw.getlist("Set-Cookie") if raw is not None and hasattr(raw, "getlist") else []
     if not cookies and headers.get("Set-Cookie"):
         cookies = [headers["Set-Cookie"]]
@@ -80,6 +94,10 @@ def analyze_headers(response: requests.Response) -> list[Finding]:
         if not cookie:
             add("Unparseable cookie", f"Cookie header {index}; values withheld.", "Review cookie serialization and attributes.")
         for morsel in cookie.values():
+            if morsel.key.startswith("__Secure-") and not morsel["secure"]:
+                add("Invalid __Secure- cookie prefix", f"Cookie header {index}; Secure attribute absent.", "Set Secure and serve the cookie over HTTPS.")
+            if morsel.key.startswith("__Host-") and (not morsel["secure"] or morsel["path"] != "/" or morsel["domain"]):
+                add("Invalid __Host- cookie prefix", f"Cookie header {index}; prefix attribute requirements not met.", "Set Secure and Path=/, omit Domain, and serve the cookie over HTTPS.")
             missing = [attribute for attribute in ("secure", "httponly", "samesite") if not morsel[attribute]]
             if missing:
                 add("Cookie missing defenses", f"Cookie header {index}: missing {', '.join(missing)}.",

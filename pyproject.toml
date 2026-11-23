@@ -14,3 +14,6 @@ gilbrt = "gilbrt.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["gilbrt*"]
+
+[tool.setuptools.package-data]
+gilbrt = ["gui_assets/*.html", "gui_assets/*.css", "gui_assets/*.js", "gui_assets/*.svg"]

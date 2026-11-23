@@ -1,5 +1,7 @@
 """Bounded JavaScript syntax inspection without evaluating website code."""
 
+import base64
+import binascii
 import heapq
 import re
 from collections.abc import Iterator
@@ -71,16 +73,164 @@ def access_branch(node, data: bytes) -> bool:
     return False
 
 
+def _constant_binding(node, data: bytes):
+    """Resolve an earlier const in this exact block; never infer across scopes.
+
+    Arrays are accepted only when every reference is a join call. Any mutation,
+    escape, alias, indexing or unknown use makes an array binding ineligible.
+    """
+    scope = node.parent
+    while scope is not None and scope.type not in {"statement_block", "program"}:
+        scope = scope.parent
+    if scope is None or scope.end_byte - scope.start_byte > 128_000:
+        return None
+    name = data[node.start_byte:node.end_byte]
+    binding = None
+    for declaration in scope.named_children:
+        if declaration.type != "lexical_declaration" or not re.match(rb"const\b", data[declaration.start_byte:declaration.start_byte + 6]):
+            continue
+        for item in declaration.named_children:
+            key = item.child_by_field_name("name")
+            if key is not None and key.type == "identifier" and data[key.start_byte:key.end_byte] == name:
+                if binding is not None or item.end_byte >= node.start_byte:
+                    return None
+                binding = item.child_by_field_name("value")
+    if binding is None:
+        return None
+    if binding.type == "array":
+        stack = [scope]
+        visited = 0
+        while stack:
+            child = stack.pop()
+            visited += 1
+            if visited > 8192:
+                return None
+            if child.type == "identifier" and data[child.start_byte:child.end_byte] == name:
+                parent = child.parent
+                if parent.type == "variable_declarator" and parent.child_by_field_name("name") == child:
+                    pass
+                elif parent.type == "member_expression" and parent.child_by_field_name("object") == child:
+                    prop = parent.child_by_field_name("property")
+                    call = parent.parent
+                    if (prop is None or data[prop.start_byte:prop.end_byte] != b"join" or call.type != "call_expression"
+                            or call.child_by_field_name("function") != parent):
+                        return None
+                else:
+                    return None
+            if child.type not in {"string", "comment", "regex"}:
+                stack.extend(child.named_children)
+    return binding
+
+
+def _builtin_unshadowed(node, data: bytes, name: str) -> bool:
+    """Reject explicit shadows/replacements of the built-in within bounded source.
+
+    Unknown uses are conservatively rejected. Runtime monkeypatching outside the
+    fetched source cannot be determined by static inspection.
+    """
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    if root.end_byte - root.start_byte > 128_000:
+        return False
+    stack = [root]
+    visited = 0
+    while stack:
+        child = stack.pop()
+        visited += 1
+        if visited > 8192:
+            return False
+        if child.type in {"identifier", "property_identifier"} and data[child.start_byte:child.end_byte].decode() == name:
+            parent = child.parent
+            if name == "atob":
+                if parent.type != "call_expression" or parent.child_by_field_name("function") != child:
+                    return False
+            else:
+                prop = parent.child_by_field_name("property") if parent.type == "member_expression" else None
+                call = parent.parent
+                if (parent.type != "member_expression" or parent.child_by_field_name("object") != child
+                        or prop is None or data[prop.start_byte:prop.end_byte] != b"fromCharCode"
+                        or call is None or call.type != "call_expression" or call.child_by_field_name("function") != parent):
+                    return False
+        if child.type not in {"string", "comment", "regex"}:
+            stack.extend(child.named_children)
+    return True
+
+
 def node_literal(node, data: bytes) -> str | None:
-    """Read a small literal node; dynamic template substitutions are excluded."""
-    while node is not None and node.type == "parenthesized_expression" and node.named_child_count == 1:
-        node = node.named_children[0]
-    if node is None or node.type not in {"string", "number", "template_string"} or node.end_byte - node.start_byte > 2048:
+    """Fold a bounded allowlist of constant syntax, without executing JavaScript.
+
+    Supports string concatenation, literal atob, String.fromCharCode and literal
+    array join, including eligible earlier const bindings in the same block.
+    Unknown calls, mutable variables, dynamic templates and oversized input fail
+    closed. This is candidate discovery, not a full JavaScript interpreter.
+    """
+    budget = [128]
+
+    def fold(part, depth=0):
+        budget[0] -= 1
+        if part is None or depth > 10 or budget[0] < 0 or part.end_byte - part.start_byte > 4096:
+            return None
+        raw = data[part.start_byte:part.end_byte].decode("utf-8", errors="replace")
+        if part.type == "parenthesized_expression" and part.named_child_count == 1:
+            return fold(part.named_children[0], depth + 1)
+        if part.type in {"string", "number", "template_string"}:
+            if part.type == "template_string" and any(c.type == "template_substitution" for c in part.named_children):
+                return None
+            value = "" if raw in {'""', "''", "``"} else literal([Token(raw, "number" if part.type == "number" else "string", part.start_byte)])
+            if part.type == "number" and (not re.fullmatch(r"0|[1-9][0-9]{0,15}", raw) or int(raw) > 2**53 - 1):
+                return None  # Avoid legacy octal and JavaScript precision differences.
+            return int(value) if value is not None and part.type == "number" else value
+        if part.type == "identifier":
+            return fold(_constant_binding(part, data), depth + 1)
+        if part.type == "binary_expression":
+            op = part.child_by_field_name("operator")
+            if op is None or data[op.start_byte:op.end_byte] != b"+":
+                return None
+            left, right = (fold(part.child_by_field_name(side), depth + 1) for side in ("left", "right"))
+            if isinstance(left, (str, int)) and isinstance(right, (str, int)) and (isinstance(left, str) or isinstance(right, str)):
+                result = str(left) + str(right)
+                return result if len(result) <= 512 else None
+        if part.type == "array" and part.named_child_count <= 64:
+            # Disallow holes and spreads; JavaScript's join rules otherwise differ.
+            items = [c for c in part.children if c.type != "comment"]
+            if any(a.type == "," and b.type in {",", "]"} for a, b in zip(items, items[1:])) or (len(items) > 1 and items[1].type == ","):
+                return None
+            values = [fold(c, depth + 1) for c in part.named_children]
+            return values if all(isinstance(v, (str, int)) for v in values) else None
+        if part.type == "call_expression":
+            function = part.child_by_field_name("function")
+            args = part.child_by_field_name("arguments")
+            if function is None or args is None or args.named_child_count > 64:
+                return None
+            name = data[function.start_byte:function.end_byte].decode()
+            values = [fold(c, depth + 1) for c in args.named_children]
+            if name == "atob" and len(values) == 1 and isinstance(values[0], str):
+                if not _builtin_unshadowed(part, data, "atob"):
+                    return None
+                try:
+                    encoded = re.sub(r"[\t\n\f\r ]", "", values[0])
+                    if len(encoded) % 4 == 1:
+                        return None
+                    return base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=True).decode("latin-1")
+                except (ValueError, binascii.Error):
+                    return None
+            if name == "String.fromCharCode" and values and all(isinstance(v, int) and 0 <= v <= 65535 for v in values):
+                if not _builtin_unshadowed(part, data, "String"):
+                    return None
+                return "".join(chr(v) for v in values)
+            if function.type == "member_expression":
+                prop = function.child_by_field_name("property")
+                if prop is not None and data[prop.start_byte:prop.end_byte] == b"join" and len(values) <= 1:
+                    sequence = fold(function.child_by_field_name("object"), depth + 1)
+                    separator = values[0] if values else ","
+                    if isinstance(sequence, list) and isinstance(separator, str):
+                        result = separator.join(str(v) for v in sequence)
+                        return result if len(result) <= 512 else None
         return None
-    if node.type == "template_string" and any(c.type == "template_substitution" for c in node.named_children):
-        return None
-    raw = data[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
-    return literal([Token(raw, "number" if node.type == "number" else "string", node.start_byte)])
+
+    result = fold(node)
+    return str(result) if isinstance(result, (str, int)) and 1 <= len(str(result)) <= 512 else None
 
 
 def relevant_nodes(tree) -> Iterator:

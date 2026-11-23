@@ -42,7 +42,8 @@ ASSIGNMENT = re.compile(
     r'''(?ix)["']?\b(?:api[_-]?key|secret|token|password|auth)\b["']?\s*[:=]\s*["']([^"'\r\n]{8,512})["']'''
 )
 KEYWORDS = re.compile(r"\b(?:TODO|FIXME|password|secret|debug|internal|admin)\b", re.I)
-CONTENT_CHECKS = {"passwords", "access-codes", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints"}
+CONTENT_CHECKS = {"passwords", "access-codes", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints",
+                  "connections", "browser-code", "forms"}
 PASSWORD = re.compile(
     r'''(?ix)(?<![\w$.-])["']?(?:[\w$.-]*?(?:password|passwd|pwd)|pass)["']?\s*(?::|=(?!=))\s*(?:"([^"\r\n]{1,512})"|'([^'\r\n]{1,512})'|`([^`\r\n]{1,512})`|([^\s,;<>"'`}{]{1,512}))'''
 )
@@ -140,9 +141,15 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
     enabled = CONTENT_CHECKS if checks is None else checks
     seen: set[tuple[str, str]] = set()
     location = safe_url(url)
+    if enabled & {"connections", "browser-code", "forms"}:
+        from .web_checks import browser_code, connections, forms
+        if "connections" in enabled:
+            findings.extend(connections(text, url, on_secret))
+        if html and "forms" in enabled:
+            findings.extend(forms(text, url))
     if "endpoints" in enabled:
         findings.extend(detect_endpoints(text, url))
-    if enabled & {"passwords", "access-codes"}:
+    if enabled & {"passwords", "access-codes", "browser-code"}:
         # HTML can contain megabytes of encoded images. Lex only script contents
         # and event handlers; preserve offsets for script line reporting.
         code_sources = [(text, 0)]
@@ -155,7 +162,11 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                     if name.startswith("on") and isinstance(value, str):
                         offset = sum(len(line) for line in text.splitlines(keepends=True)[:max(0, (node.sourceline or 1) - 1)])
                         code_sources.append((value, offset))
-        for candidate, base_offset in ((c, offset) for source, offset in code_sources
+        if "browser-code" in enabled:
+            for source, offset in code_sources:
+                findings.extend(browser_code(source, url, text.count("\n", 0, offset)))
+        credential_sources = code_sources if enabled & {"passwords", "access-codes"} else []
+        for candidate, base_offset in ((c, offset) for source, offset in credential_sources
                                        for c in detect_access_codes(source, include_password_assignments="passwords" in enabled)):
             if "access-codes" not in enabled and not candidate.password:
                 continue

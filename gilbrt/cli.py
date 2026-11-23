@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -24,7 +25,7 @@ from .reporter import copy_to_clipboard, export, print_summary, render_report
 from .scanner import CONTENT_CHECKS, safe_url, scan
 from .updater import update_installation
 
-DEFAULT_CHECKS = ["passwords", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints", "headers", "tls", "breaches", "access-codes"]
+DEFAULT_CHECKS = ["passwords", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints", "headers", "tls", "breaches", "access-codes", "connections", "browser-code", "forms"]
 SEARCH_OPTIONS = DEFAULT_CHECKS + ["local-ai"]
 
 
@@ -91,6 +92,8 @@ def integer(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     """Build the public command-line interface."""
     p = argparse.ArgumentParser(prog="gilbrt", description=__doc__)
+    p.add_argument("--gui", action="store_true", help="Open the local graphical audit interface")
+    p.add_argument("--gui-port", type=integer, default=4174, help="Local GUI port (default: 4174)")
     p.add_argument("--url", type=url_argument, help="Exact HTTP(S) origin to audit (prompted in interactive mode)")
     p.add_argument("--confirm-authorized", action="store_true",
                    help="Confirm explicit authorization to audit this system")
@@ -162,11 +165,154 @@ def interactive_setup(args: argparse.Namespace, console: Console, selected: set[
     return selected
 
 
+class AuditCancelled(Exception):
+    """A GUI audit was cancelled at a safe engine boundary."""
+
+
+def run_audit(args, selected, progress=None, cancelled=None):
+    """Shared CLI/GUI engine; retain raw source only in engine memory.
+
+    Callbacks receive redacted resource references, never source or revealed values.
+    Cancellation waits for the current bounded network/inference call to return.
+    """
+    def checkpoint():
+        if cancelled and cancelled():
+            raise AuditCancelled()
+    def emit(stage, **details):
+        checkpoint()
+        if progress:
+            progress({"stage": stage, **details})
+    client = None
+    analyzer = None
+    try:
+        checkpoint()
+        emit("Preparing audit")
+        target = normalize(args.url)
+        setup_findings = []
+        if "local-ai" in selected:
+            try:
+                budget = args.ai_max_chunks if args.ai_max_chunks is not None else (0 if args.local_model == "bundled" else 12)
+                analyzer = (BundledAnalyzer(budget, candidate_limit=args.ai_candidate_limit) if args.local_model == "bundled" else
+                            LocalAnalyzer(args.local_model, args.ollama_url, budget))
+            except MemoryError:
+                setup_findings.append(Finding("Info", "Coverage", "Optional AI skipped: low available memory", safe_url(target),
+                                              "The small model needs at least 768 MiB of available physical memory before starting.",
+                                              "Close other applications or run static checks; no model process was started."))
+        client = ScopedClient(target, args.rate_limit, max_resource_bytes=args.max_resource_mb * 1024 * 1024)
+        original_pace = client.pace
+        def paced():
+            checkpoint()
+            if cancelled:
+                while client.last_request is not None:
+                    remaining = client.delay - (time.monotonic() - client.last_request)
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(.1, remaining))
+                    checkpoint()
+                client.last_request = time.monotonic()
+            else:
+                original_pace()
+            checkpoint()
+        client.pace = paced
+        if analyzer:
+            original_request = analyzer.request
+            def checked_request(*request_args, **request_kwargs):
+                checkpoint()
+                emit("Local AI inference")
+                result = original_request(*request_args, **request_kwargs)
+                checkpoint()
+                return result
+            analyzer.request = checked_request
+        config = load_config(args.active_config, client) if args.active else None
+        crawler = Crawler(client, args.max_depth, args.max_pages, args.ignore_robots, args.include_url)
+        visible_values: dict[int, str] = {}
+        def reveal(finding: Finding, value: str) -> None:
+            """Keep explicit local reveal separate from redacted findings and exports."""
+            visible_values[id(finding)] = value
+        findings = setup_findings
+        resources = 0
+        resource_inventory = []
+        if analyzer and args.local_model == "bundled":
+            analyzer.progress = lambda batch, remaining: emit("AI review", batch=batch, candidates_pending=remaining)
+        # Respect the same pacing clock for TLS, crawl, HIBP and active probes.
+        emit("Checking TLS" if "tls" in selected else "Discovering resources")
+        if "tls" in selected:
+            client.pace()
+            findings.extend(analyze_tls(target))
+        for resource in crawler.crawl():
+            checkpoint()
+            emit("Analyzing resource", resource=safe_url(resource.url), resources_scanned=resources)
+            resources += 1
+            resource_inventory.append({"resource": safe_url(resource.url), "status": resource.response.status_code,
+                                       "kind": "HTML" if resource.html else "Client-side content",
+                                       "bytes": len(resource.response.content)})
+            if "headers" in selected:
+                findings.extend(analyze_headers(resource.response, document=resource.html))
+            findings.extend(scan(resource.body, resource.url, resource.html, selected & CONTENT_CHECKS,
+                                 reveal if args.show_secrets else None))
+            if analyzer:
+                findings.extend(analyzer.analyze(resource.body, resource.url, resource.html,
+                                                 reveal if args.show_secrets else None))
+            if resource.response.status_code >= 400:
+                client.issue("HTTP error response audited", resource.url)
+            emit("Resource analyzed", resource=safe_url(resource.url), resources_scanned=resources,
+                 findings=len(findings))
+        emit("Finalizing findings", resources_scanned=resources, findings=len(findings))
+        if args.hibp_api_key and "breaches" in selected:
+            client.pace()
+            findings.extend(check_breaches(target, args.hibp_api_key))
+        if config:
+            findings.extend(run_active(client, config, crawler.permitted))
+        if analyzer and analyzer.skipped:
+            unit = "candidate batches" if args.local_model == "bundled" else "source chunks"
+            findings.append(Finding("Info", "Coverage", "Local AI review budget reached", safe_url(target),
+                                    f"Analyzed {analyzer.completed} {unit}; remaining candidates/source were not model-reviewed.",
+                                    "Use --ai-max-batches 0 to review all retained candidates sequentially."))
+        if analyzer and getattr(analyzer, "candidate_limit_reached", False):
+            findings.append(Finding("Info", "Coverage", "Candidate queue limit reached", safe_url(target),
+                                    f"More than {args.ai_candidate_limit} candidates were found in a resource; highest-ranked candidates were reviewed.",
+                                    "Raise --ai-candidate-limit to retain more candidates; inference remains sequential."))
+        findings.extend(client.errors)
+        metadata = {"target": safe_url(target), "resources_scanned": resources, "resources_attempted": crawler.attempts, "active": args.active,
+                    "robots_respected": not args.ignore_robots, "max_depth": args.max_depth,
+                    "max_pages": args.max_pages, "rate_limit_seconds": args.rate_limit,
+                    "search_categories": sorted(selected), "resource_inventory": resource_inventory,
+                    "hibp_queried": bool(args.hibp_api_key and "breaches" in selected),
+                    "max_resource_mb": args.max_resource_mb,
+                    "local_ai": {"requested": "local-ai" in selected, "enabled": analyzer is not None,
+                                 "chunks_analyzed": analyzer.completed if analyzer else 0,
+                                 "chunks_submitted": analyzer.used if analyzer else 0,
+                                 "budget_reached": analyzer.skipped if analyzer else False,
+                                 "failed": analyzer.failed if analyzer else False,
+                                 "backend": ("llama.cpp" if args.local_model == "bundled" else "ollama") if analyzer else None,
+                                 "context_tokens": analyzer.context_size if analyzer else None,
+                                 "budget_unit": "candidate_batches" if analyzer and args.local_model == "bundled" else "source_chunks" if analyzer else None,
+                                 "chunk_characters": analyzer.chunk_size if analyzer and args.local_model != "bundled" else None,
+                                 "candidate_excerpt_characters": 280 if analyzer and args.local_model == "bundled" else None,
+                                 "relevant_candidates": getattr(analyzer, "relevant_candidates", None) if analyzer else None,
+                                 "reviewed_candidates": getattr(analyzer, "reviewed_candidates", None) if analyzer else None,
+                                 "cached_candidate_reviews": getattr(analyzer, "cache_hits", None) if analyzer else None,
+                                 "candidate_limit": args.ai_candidate_limit if analyzer and args.local_model == "bundled" else None,
+                                 "candidate_limit_reached": getattr(analyzer, "candidate_limit_reached", False) if analyzer else False,
+                                 "runner_peak_rss_bytes": analyzer.memory_bytes() if analyzer and args.local_model == "bundled" else None}}
+        checkpoint()
+        emit("Complete", resources_scanned=resources, findings=len(findings))
+        return findings, metadata, visible_values
+    finally:
+        if client:
+            client.session.close()
+        if analyzer:
+            analyzer.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run an audit; exit 0 completed, 1 configuration/operational error, 130 interrupted."""
     p = parser()
     arguments = sys.argv[1:] if argv is None else argv
     args = p.parse_args(arguments)
+    if args.gui:
+        from .gui import serve
+        return serve(args.gui_port)
     if args.list_models or args.install_models is not None:
         from .model_install import manage_models
         console = Console()
@@ -223,92 +369,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.interactive:
         print_startup(console)
     console.print(DISCLAIMER, style="bold yellow", markup=False)
-    client = None
-    analyzer = None
     try:
-        target = normalize(args.url)
-        setup_findings = []
-        if "local-ai" in selected:
-            try:
-                budget = args.ai_max_chunks if args.ai_max_chunks is not None else (0 if args.local_model == "bundled" else 12)
-                analyzer = (BundledAnalyzer(budget, candidate_limit=args.ai_candidate_limit) if args.local_model == "bundled" else
-                            LocalAnalyzer(args.local_model, args.ollama_url, budget))
-            except MemoryError:
-                setup_findings.append(Finding("Info", "Coverage", "Optional AI skipped: low available memory", safe_url(target),
-                                              "The small model needs at least 768 MiB of available physical memory before starting.",
-                                              "Close other applications or run static checks; no model process was started."))
-        client = ScopedClient(target, args.rate_limit, max_resource_bytes=args.max_resource_mb * 1024 * 1024)
-        config = load_config(args.active_config, client) if args.active else None
-        crawler = Crawler(client, args.max_depth, args.max_pages, args.ignore_robots, args.include_url)
-        visible_values: dict[int, str] = {}
-        def reveal(finding: Finding, value: str) -> None:
-            """Keep explicit local reveal separate from redacted findings and exports."""
-            visible_values[id(finding)] = value
-        findings = setup_findings
-        resources = 0
-        resource_inventory = []
         with console.status("Auditing authorized scope…") as status:
-            if analyzer and args.local_model == "bundled":
-                analyzer.progress = lambda batch, remaining: status.update(f"AI review batch {batch}; {remaining} candidates pending in this resource…")
-            # Respect the same pacing clock for TLS, crawl, HIBP and active probes.
-            if "tls" in selected:
-                client.pace()
-                findings.extend(analyze_tls(target))
-            for resource in crawler.crawl():
-                resources += 1
-                resource_inventory.append({"resource": safe_url(resource.url), "status": resource.response.status_code,
-                                           "kind": "HTML" if resource.html else "Client-side content",
-                                           "bytes": len(resource.response.content)})
-                if resource.html and "headers" in selected:
-                    findings.extend(analyze_headers(resource.response))
-                findings.extend(scan(resource.body, resource.url, resource.html, selected & CONTENT_CHECKS,
-                                     reveal if args.show_secrets else None))
-                if analyzer:
-                    findings.extend(analyzer.analyze(resource.body, resource.url, resource.html,
-                                                     reveal if args.show_secrets else None))
-                if resource.response.status_code >= 400:
-                    client.issue("HTTP error response audited", resource.url)
-            if args.hibp_api_key and "breaches" in selected:
-                client.pace()
-                findings.extend(check_breaches(target, args.hibp_api_key))
-            if config:
-                findings.extend(run_active(client, config, crawler.permitted))
-            if analyzer and analyzer.skipped:
-                unit = "candidate batches" if args.local_model == "bundled" else "source chunks"
-                findings.append(Finding("Info", "Coverage", "Local AI review budget reached", safe_url(target),
-                                        f"Analyzed {analyzer.completed} {unit}; remaining candidates/source were not model-reviewed.",
-                                        "Use --ai-max-batches 0 to review all retained candidates sequentially."))
-            if analyzer and getattr(analyzer, "candidate_limit_reached", False):
-                findings.append(Finding("Info", "Coverage", "Candidate queue limit reached", safe_url(target),
-                                        f"More than {args.ai_candidate_limit} candidates were found in a resource; highest-ranked candidates were reviewed.",
-                                        "Raise --ai-candidate-limit to retain more candidates; inference remains sequential."))
-            findings.extend(client.errors)
+            findings, metadata, visible_values = run_audit(
+                args, selected, lambda event: status.update(event["stage"]))
         print_summary(findings, console, visible_values if args.show_secrets else None)
-        if resources == 0:
+        if metadata["resources_scanned"] == 0:
             console.print("No source resources were scanned. This run cannot establish whether passwords or codes are exposed.", style="bold yellow")
-        console.print(f"Scanned {resources} resources; {len(findings)} observations. Coverage is bounded.")
-        metadata = {"target": safe_url(target), "resources_scanned": resources, "active": args.active,
-                    "robots_respected": not args.ignore_robots, "max_depth": args.max_depth,
-                    "max_pages": args.max_pages, "rate_limit_seconds": args.rate_limit,
-                    "search_categories": sorted(selected), "resource_inventory": resource_inventory,
-                    "hibp_queried": bool(args.hibp_api_key and "breaches" in selected),
-                    "max_resource_mb": args.max_resource_mb,
-                    "local_ai": {"requested": "local-ai" in selected, "enabled": analyzer is not None,
-                                 "chunks_analyzed": analyzer.completed if analyzer else 0,
-                                 "chunks_submitted": analyzer.used if analyzer else 0,
-                                 "budget_reached": analyzer.skipped if analyzer else False,
-                                 "failed": analyzer.failed if analyzer else False,
-                                 "backend": ("llama.cpp" if args.local_model == "bundled" else "ollama") if analyzer else None,
-                                 "context_tokens": analyzer.context_size if analyzer else None,
-                                 "budget_unit": "candidate_batches" if analyzer and args.local_model == "bundled" else "source_chunks" if analyzer else None,
-                                 "chunk_characters": analyzer.chunk_size if analyzer and args.local_model != "bundled" else None,
-                                 "candidate_excerpt_characters": 280 if analyzer and args.local_model == "bundled" else None,
-                                 "relevant_candidates": getattr(analyzer, "relevant_candidates", None) if analyzer else None,
-                                 "reviewed_candidates": getattr(analyzer, "reviewed_candidates", None) if analyzer else None,
-                                 "cached_candidate_reviews": getattr(analyzer, "cache_hits", None) if analyzer else None,
-                                 "candidate_limit": args.ai_candidate_limit if analyzer and args.local_model == "bundled" else None,
-                                 "candidate_limit_reached": getattr(analyzer, "candidate_limit_reached", False) if analyzer else False,
-                                 "runner_peak_rss_bytes": analyzer.memory_bytes() if analyzer and args.local_model == "bundled" else None}}
+        console.print(f"Scanned {metadata['resources_scanned']} resources; {len(findings)} observations. Coverage is bounded.")
         if args.output:
             export(findings, args.output, args.format, metadata)
             console.print(Text(f"Full report written: {os.path.abspath(args.output)}", style="green"))
@@ -325,8 +393,3 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError):
         console.print("Audit failed: invalid configuration or report path. Details withheld to protect credentials.", style="red")
         return 1
-    finally:
-        if client:
-            client.session.close()
-        if analyzer:
-            analyzer.close()
