@@ -60,8 +60,8 @@ _WORDMARK = (
     r" \__, |_|_|_.__/|_|   \__|",
     r" |___/                    ",
 )
-# Shorten the silhouette by 20%, retaining the detailed hat marks and entire face.
-_DISPLAY_ROWS = tuple(row for row in range(len(_MASCOT)) if row not in {1, 10, 11, 14, 28, 29, 30, 32})
+# Preserve every original row so the mascot keeps its original proportions.
+_DISPLAY_ROWS = tuple(range(len(_MASCOT)))
 _LEFT_PADDING = min(len(row) - len(row.lstrip()) for row in _MASCOT)
 _FULL_WIDTH = max(map(len, _MASCOT)) - _LEFT_PADDING
 
@@ -87,7 +87,7 @@ def _color(row: int, column: int, char: str) -> str:
 
 
 def _art(full: bool) -> list[Text]:
-    """Keep source-width detail in the shorter silhouette; reduce on narrow terminals."""
+    """Keep the original proportions and detail; reduce on narrow terminals."""
     step = 1 if full else 2
     width = max(map(len, _MASCOT))
     weight = {"%": 6, "#": 6, "*": 5, "+": 4, "=": 4, "-": 3, ":": 2}
