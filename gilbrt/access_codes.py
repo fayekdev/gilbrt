@@ -10,7 +10,7 @@ from dataclasses import dataclass
 LEXER = re.compile(
     r'''(?P<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|(?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(?P<number>\b\d+(?:\.\d+)?\b)|(?P<identifier>[A-Za-z_$][\w$]*)|(?P<operator>===|!==|==|!=|=>|&&|\|\|)|(?P<symbol>[^\s])'''
 )
-PASSWORD_NAME = re.compile(r"(?:^|[_-])(?:password|passwd|pwd|pass)(?:[_-]?input)?$", re.I)
+PASSWORD_NAME = re.compile(r"(?:^|[_-])(?:password|passwd|pwd|pass)(?:[_-]?(?:input|value|text))?$", re.I)
 CODE_NAME = re.compile(r"(?:^|[_-])(?:passcode|(?:access|invite|unlock|security|verification|auth|admin)[_-]?code|secret|pin|otp)$", re.I)
 
 
@@ -43,6 +43,7 @@ class Candidate:
     operator: str
     password: bool
     confident_name: bool
+    basis: str = "named credential or access branch"
 
 
 def literal(tokens: list[Token]) -> str | None:

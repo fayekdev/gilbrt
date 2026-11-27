@@ -99,6 +99,19 @@ class GUITests(unittest.TestCase):
         self.assertTrue(any(f["category"] == "Password" for f in data["report"]["findings"]))
         self.assertNotIn("/private", Fixture.visits)
         self.assertNotIn(FIXTURE_PASSWORD, json.dumps(data))
+        index = next(i for i, f in enumerate(data["report"]["findings"]) if f["category"] == "Password")
+        evidence_url = self.base + "/api/evidence"
+        params = {"index": index, "report_id": data["report_id"]}
+        revealed = self.session.get(evidence_url, params=params)
+        self.assertEqual(revealed.status_code, 200)
+        self.assertIn(FIXTURE_PASSWORD, revealed.json()["evidence"])
+        self.assertEqual(revealed.headers["Cache-Control"], "no-store")
+        self.assertEqual(self.session.get(evidence_url, params=params, headers={"X-Gilbrt-Token": "wrong"}).status_code, 403)
+        self.assertEqual(self.session.get(evidence_url, params={**params, "report_id": "stale"}).status_code, 409)
+        self.assertEqual(self.session.get(evidence_url, params={**params, "index": -1}).status_code, 404)
+        unchanged = self.session.get(self.base + "/api/state", params={"report_id": data["report_id"]}).json()
+        self.assertNotIn("report", unchanged)
+        self.assertEqual(unchanged["job"]["status"], "complete")
         self.assertTrue(any(event["stage"] == "Resource analyzed" for event in data["job"]["events"]))
         for fmt in ("json", "html", "csv", "ai"):
             response = self.session.get(self.base + "/api/export", params={"format": fmt}, timeout=3)
@@ -113,6 +126,28 @@ class GUITests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(Fixture.visits, [])
         self.assertIsNone(self.state.job)
+
+    def test_offline_file_audit_export_and_authorization(self):
+        payload = {"authorized":True,"settings":{**DEFAULT_SETTINGS,"model":"","checks":["passwords","headers","tls"]},
+                   "files":[{"name":"fixture.js","content":f'const dbPassword="{FIXTURE_PASSWORD}";'}]}
+        with patch("gilbrt.gui.ScopedClient") as network:
+            response = self.session.post(self.base+"/api/offline",json=payload)
+            self.assertEqual(response.status_code,202)
+            data = self.finish()
+            network.assert_not_called()
+        self.assertEqual(data["job"]["status"],"complete")
+        self.assertEqual(data["report"]["metadata"]["mode"],"files")
+        self.assertEqual(data["report"]["session"]["target_origin"],"Local files")
+        self.assertTrue(any(f["category"] == "Password" for f in data["report"]["findings"]))
+        self.assertNotIn(FIXTURE_PASSWORD,json.dumps(data))
+        self.assertEqual(Fixture.visits,[])
+        for fmt in ("json","html","csv","ai"):
+            exported = self.session.get(self.base+"/api/export",params={"format":fmt})
+            self.assertEqual(exported.status_code,200)
+            self.assertNotIn(FIXTURE_PASSWORD,exported.text)
+        self.assertEqual(self.session.post(self.base+"/api/offline",json={**payload,"authorized":False}).status_code,400)
+        self.assertEqual(self.session.post(self.base+"/api/offline",json=payload,headers={"X-Gilbrt-Token":"wrong"}).status_code,403)
+        self.assertEqual(self.session.post(self.base+"/api/offline",json={**payload,"files":[]}).status_code,400)
 
     def test_token_origin_host_and_asset_allowlist(self):
         for endpoint in ("/api/state", "/api/models", "/api/export"):
@@ -231,7 +266,8 @@ class GUITests(unittest.TestCase):
         with patch("gilbrt.gui.discover_models", return_value={"choices":[{"id":"fixture:local"}]}), patch("gilbrt.gui.run_audit", side_effect=run):
             self.assertEqual(self.start(model="fixture:local", ai_max_chunks=2, ai_candidate_limit=50).status_code, 202)
             data = self.finish()
-        self.assertEqual(data["job"]["status"], "complete")
+        self.assertEqual(data["job"]["status"], "failed")
+        self.assertEqual(data["report"]["assessment"]["status"], "source_scan_failed")
         self.assertEqual(captured[0][:3], ("fixture:local", 2, 50))
         self.assertIn("local-ai", captured[0][4])
 
@@ -249,6 +285,14 @@ class GUITests(unittest.TestCase):
             data = self.finish()
         self.assertEqual(data["job"]["status"], "cancelled")
         self.assertEqual(data["report"], previous)
+
+    def test_snapshot_shares_immutable_report_but_isolates_job(self):
+        self.state.report = {"findings": [], "metadata": {}}
+        self.state.job = {"status": "complete", "events": []}
+        snapshot = self.state.snapshot()
+        self.assertIs(snapshot["report"], self.state.report)
+        snapshot["job"]["events"].append({"stage": "unrelated"})
+        self.assertEqual(self.state.job["events"], [])
 
     def test_cancellation_interrupts_long_request_pacing(self):
         self.assertEqual(self.start(rate_limit=30).status_code, 202)

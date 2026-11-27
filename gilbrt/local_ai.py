@@ -191,7 +191,7 @@ class LocalAnalyzer:
                         raise ValueError("Invalid model findings")
                     self.completed += 1
                     from .js_parser import candidates
-                    syntax_candidates = candidates(chunk, limit=4096, include_password_assignments=True)
+                    syntax_candidates = candidates(chunk, limit=4096, include_password_assignments=True, review=True)
                     for item in items[:32]:
                         if not isinstance(item, dict):
                             continue
@@ -204,16 +204,14 @@ class LocalAnalyzer:
                         if grounded is None:
                             continue
                         quote, quote_offset = grounded
-                        literals = {literal([Token(m.group(), m.lastgroup or "symbol", m.start())])
-                                    for m in LEXER.finditer(quote) if m.lastgroup in {"string", "number"}}
                         candidate = next((c for c, _, _ in syntax_candidates if c.value == value
                                           and quote_offset <= c.offset < quote_offset + len(quote)), None)
-                        if value not in literals or (url, value) in self.seen or candidate is None:
+                        if (url, value) in self.seen or candidate is None:
                             continue
                         kind = "password" if candidate.password else "access_code"
                         self.seen.add((url, value))
                         line = base_line + source.count("\n", 0, start + quote_offset) + 1
-                        findings.append(Finding("Critical" if kind == "password" else "Warning", "Local AI", "Model-assisted access-control candidate", safe_url(url),
+                        findings.append(Finding("Critical" if kind == "password" else "Warning" if candidate.confident_name else "Info", "Local AI", "Model-assisted access-control candidate", safe_url(url),
                             f"Line {line}; kind {kind}; {mask(value)}; literal verified in fetched source, meaning unconfirmed",
                             "Review the client-side gate and enforce authorization server-side. Rotate real exposed credentials."))
                         if on_secret:

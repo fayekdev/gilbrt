@@ -5,8 +5,8 @@
   "description": "A terminal-first website auditor.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#111310",
-  "theme_color": "#111310",
+  "background_color": "#0b0d0c",
+  "theme_color": "#0b0d0c",
   "icons": [
     {
       "src": "/icon-192.png",

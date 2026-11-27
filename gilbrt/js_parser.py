@@ -13,6 +13,8 @@ from .access_codes import Candidate, CODE_NAME, PASSWORD_NAME, Token, credential
 
 LANGUAGE = Language(tree_sitter_javascript.language())
 BORING = {"true", "false", "null", "undefined", "string", "number", "boolean", "function", "object", "symbol", "loading", "success", "error"}
+COLLECTION_CALLBACKS = {"filter", "map", "find", "findIndex", "some", "every", "sort", "reduce", "forEach", "then", "catch"}
+REVIEW_STATES = {"done", "prog", "pending", "complete", "completed", "present", "absent", "active", "inactive", "expanded", "collapsed", "ready", "checked", "unchecked"}
 
 
 def subject_names(node, data: bytes) -> list[str]:
@@ -238,7 +240,7 @@ def relevant_nodes(tree) -> Iterator:
     cursor = tree.walk()
     while True:
         node = cursor.node
-        if node.type in {"binary_expression", "variable_declarator", "assignment_expression", "pair"}:
+        if node.type in {"binary_expression", "variable_declarator", "assignment_expression", "pair", "switch_case"}:
             yield node
         if node.type not in {"string", "regex", "comment"} and cursor.goto_first_child():
             continue
@@ -247,7 +249,123 @@ def relevant_nodes(tree) -> Iterator:
                 return
 
 
-def candidates(text: str, limit: int = 128, include_password_assignments: bool = False) -> list[tuple[Candidate, str, int]]:
+def callback_input_kind(node, other, data: bytes) -> str | None:
+    """Connect a compared callback parameter to an explicit password/code input.
+
+    Custom dialog names and minified parameter names are allowed. The evidence
+    comes from the callback's own call arguments, never nearby comments or labels
+    from unrelated functions. No callback or target code is executed.
+    """
+    parent = node.parent
+    for _ in range(12):
+        if parent is None:
+            return None
+        if parent.type in {"arrow_function", "function_expression", "function_declaration"}:
+            args = parent.parent
+            if args is None or args.type != "arguments" or args.parent.type != "call_expression":
+                return None
+            function = args.parent.child_by_field_name("function")
+            if function is not None and function.type == "member_expression":
+                prop = function.child_by_field_name("property")
+                if prop is not None and data[prop.start_byte:prop.end_byte].decode() in COLLECTION_CALLBACKS:
+                    return None
+            params = parent.child_by_field_name("parameters") or parent.child_by_field_name("parameter")
+            parameters = params.named_children if params is not None and params.type == "formal_parameters" else [params] if params is not None else []
+            names = {data[p.start_byte:p.end_byte].decode() for p in parameters if p.type == "identifier"}
+            if not names.intersection(subject_names(other, data)):
+                return None
+            values = [node_literal(arg, data) for arg in args.named_children if arg != parent]
+            if any(value is not None and value.lower() == "password" for value in values):
+                return "password"
+            if any(value is not None and re.fullmatch(r"admin code|access code|passcode|pin", value, re.I) for value in values):
+                return "access-code"
+            return None
+        parent = parent.parent
+    return None
+
+
+def review_control(node, data: bytes) -> bool:
+    """Broader AI-only pool: literal checks in returning/security-related code.
+
+    This is syntax grounding, not a verdict that a literal is a credential. The
+    model must distinguish credential validators from ordinary UI predicates.
+    """
+    enclosing = node.parent
+    for _ in range(16):
+        if enclosing is None:
+            break
+        if enclosing.type == "template_substitution":
+            return False  # Rendering a style/status is not an access decision.
+        if enclosing.type in {"function_declaration", "function_expression", "arrow_function"}:
+            args = enclosing.parent
+            if args is not None and args.type == "arguments" and args.parent.type == "call_expression":
+                function = args.parent.child_by_field_name("function")
+                prop = function.child_by_field_name("property") if function is not None and function.type == "member_expression" else None
+                if prop is not None and data[prop.start_byte:prop.end_byte].decode() in COLLECTION_CALLBACKS:
+                    return False
+            name = enclosing.child_by_field_name("name")
+            if name is None and enclosing.parent is not None and enclosing.parent.type == "variable_declarator":
+                name = enclosing.parent.child_by_field_name("name")
+            label = data[name.start_byte:name.end_byte].decode() if name is not None else ""
+            label = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", label)
+            if re.search(r"(?:^|_)(?:theme|color|locale|currency|format|layout|mime|route|path)(?:_|$)", label, re.I):
+                return False
+            break
+        enclosing = enclosing.parent
+    parent = node.parent
+    for _ in range(8):
+        if parent is None or parent.type == "program":
+            break
+        if parent.type == "return_statement":
+            return True
+        if parent.type == "arrow_function" and parent.child_by_field_name("body") is not None:
+            body = parent.child_by_field_name("body")
+            return body.type != "statement_block" and body.start_byte <= node.start_byte < body.end_byte
+        if parent.type in {"if_statement", "ternary_expression"}:
+            stack = [parent]
+            visited = 0
+            while stack and visited < 128:
+                child = stack.pop()
+                visited += 1
+                if child.type == "return_statement" and any(c.type in {"true", "false"} for c in child.named_children):
+                    return True
+                if child.type == "call_expression":
+                    target = child.child_by_field_name("function")
+                    if target is not None and target.type == "member_expression":
+                        target = target.child_by_field_name("property")
+                    if target is not None and target.type in {"identifier", "property_identifier"}:
+                        name = data[target.start_byte:target.end_byte].decode()
+                        if re.search(r"protected|authenticat|authoriz|login|access|invit", name, re.I):
+                            return True
+                if child.type not in {"string", "template_string", "regex", "comment", "function_declaration", "function_expression", "arrow_function"}:
+                    stack.extend(child.named_children)
+        if parent.type in {"function_declaration", "function_expression", "arrow_function"}:
+            break
+        parent = parent.parent
+    return False
+
+
+def secret_literals(text: str) -> Iterator[tuple[str, int]]:
+    """Yield bounded literal/constant values at credential-like assignment sites."""
+    data = text.encode("utf-8", errors="replace")
+    tree = Parser(LANGUAGE).parse(data)
+    for node in relevant_nodes(tree):
+        if node.type not in {"variable_declarator", "assignment_expression", "pair"}:
+            continue
+        subject = node.child_by_field_name("key" if node.type == "pair" else "name" if node.type == "variable_declarator" else "left")
+        if subject is None or subject.end_byte - subject.start_byte > 256:
+            continue
+        names = [re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name) for name in subject_names(subject, data)]
+        if not any(re.search(r"(?:^|[_-])(?:api[_-]?key|key|token|secret|authorization)(?:$|[_-])", name, re.I) for name in names):
+            continue
+        value_node = node.child_by_field_name("value" if node.type in {"pair", "variable_declarator"} else "right")
+        value = node_literal(value_node, data)
+        if value is not None:
+            yield value, len(data[:node.start_byte].decode("utf-8", errors="replace"))
+
+
+def candidates(text: str, limit: int = 128, include_password_assignments: bool = False,
+               review: bool = False) -> list[tuple[Candidate, str, int]]:
     """Return at most limit ranked candidates, source excerpts and scores.
 
     Strings, regex literals and comments are parsed as JavaScript syntax. This
@@ -258,8 +376,13 @@ def candidates(text: str, limit: int = 128, include_password_assignments: bool =
     best = []
     serial = 0
     for node in relevant_nodes(tree):
-        comparison = node.type == "binary_expression"
-        if comparison:
+        comparison = node.type in {"binary_expression", "switch_case"}
+        if node.type == "switch_case":
+            operator = "==="
+            value = node_literal(node.child_by_field_name("value"), data)
+            switch = node.parent.parent if node.parent is not None else None
+            other = switch.child_by_field_name("value") if switch is not None else None
+        elif comparison:
             operator_node = node.child_by_field_name("operator")
             if operator_node is None:
                 continue
@@ -282,8 +405,9 @@ def candidates(text: str, limit: int = 128, include_password_assignments: bool =
         if re.search(r"\.\s*(?:length|size|status|statusCode|keyCode|charCode)\b", expression):
             continue
         names = [re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name) for name in subject_names(other, data)]
-        password = any(PASSWORD_NAME.search(name) for name in names)
-        named = password or any(CODE_NAME.search(name) for name in names)
+        callback_kind = callback_input_kind(node, other, data) if comparison else None
+        password = any(PASSWORD_NAME.search(name) for name in names) or callback_kind == "password"
+        named = password or callback_kind == "access-code" or any(CODE_NAME.search(name) for name in names)
         generic_code = any(re.fullmatch(r"(?:entered[_-]?)?code", name, re.I) for name in names)
         # Generic `code` commonly means an HTTP/error/keyboard code. A PIN-shaped
         # value or an access-specific branch is needed before treating it as a gate.
@@ -293,7 +417,9 @@ def candidates(text: str, limit: int = 128, include_password_assignments: bool =
         if comparison and value.lower() in BORING:
             continue
         if not named and (not comparison or len(value) < 4 or not access_branch(node, data)):
-            continue
+            if not (review and comparison and value.lower() not in REVIEW_STATES and 4 <= len(value) <= 512 and not value.startswith(("/", "http:", "https:"))
+                    and "/" not in value and review_control(node, data)):
+                continue
         if not comparison and password and not include_password_assignments:
             continue  # The dedicated password-assignment check handles these.
         # Keep a short excerpt; never copy enormous embedded binary strings.
@@ -303,7 +429,8 @@ def candidates(text: str, limit: int = 128, include_password_assignments: bool =
         score += 30 * len(set(re.findall(r"password|passwd|admin|passcode|unlock|login|access.?code", context, re.I)))
         score += 25 if value.isdigit() and 4 <= len(value) <= 12 else 0
         offset = len(data[:node.start_byte].decode("utf-8", errors="replace"))
-        candidate = Candidate(value, offset, operator, password, named)
+        basis = "password-input callback comparison" if callback_kind == "password" else "code-input callback comparison" if callback_kind else "named credential or access branch" if named or access_branch(node, data) else "validator review only"
+        candidate = Candidate(value, offset, operator, password, named, basis)
         entry = (score, -serial, candidate, context[:700])
         serial += 1
         if len(best) < limit:

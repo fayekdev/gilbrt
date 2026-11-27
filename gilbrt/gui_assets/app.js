@@ -1,187 +1,322 @@
+'use strict';
 const $ = selector => document.querySelector(selector);
 const all = selector => [...document.querySelectorAll(selector)];
-const safe = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-const names = {'passwords':'Passwords','api-keys':'API keys','tokens':'Tokens','private-keys':'Private keys','entropy':'High-entropy values','comments':'Comments','endpoints':'Endpoint references','headers':'Security headers','tls':'TLS configuration','breaches':'Breach catalogue','access-codes':'Access codes','connections':'Connection strings','browser-code':'Browser code','forms':'Forms'};
-let token = '', settings = null, checks = [], models = [], report = null, job = null;
-let pollTimer = null, toastTimer = null, lastTerminal = '', connected = false;
-const severityColor = {Critical:'var(--red)',Warning:'var(--yellow)',Info:'var(--blue)'};
+const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const icon = name => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+const checkNames = {'passwords':'Passwords','api-keys':'API keys','tokens':'Tokens','private-keys':'Private keys','entropy':'High-entropy values','comments':'Comments','endpoints':'Endpoint references','headers':'Security headers','tls':'TLS','breaches':'Breach catalogue','access-codes':'Access codes','connections':'Connection strings','browser-code':'Browser code','forms':'Forms'};
+const PAGE_SIZE = 40;
+let token = '', settings = null, checks = [], sourceChecks = [], models = [{id:'',name:'Static checks only'}];
+let report = null, reportId = '', job = null, mode = 'website', connected = false, booting = false;
+let pollTimer, toastTimer, lastTerminal = '', findingPage = 0, resourcePage = 0, detailIndex = -1, evidenceRequest = 0;
+
 async function api(path, body) {
-  const response = await fetch(path,{method:body===undefined?'GET':'POST',headers:{'X-Gilbrt-Token':token,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+  let response;
+  try {
+    response = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST', signal: AbortSignal.timeout(15000),
+      headers: {'X-Gilbrt-Token':token, ...(body === undefined ? {} : {'Content-Type':'application/json'})},
+      ...(body === undefined ? {} : {body:JSON.stringify(body)})
+    });
+  } catch {
+    connection(false);
+    throw Error('Engine unavailable. Start gilbrt --gui, then reconnect.');
+  }
   const data = await response.json();
-  if(!response.ok) throw Error(data.error || 'The local engine could not complete this request.');
+  if (!response.ok) throw Error(data.error || 'Request failed.');
   return data;
 }
-function notify(message){clearTimeout(toastTimer);$('#toast').textContent=message;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,4500);}
-function navigate(page){
-  if(!['overview','findings','coverage','settings'].includes(page))page='overview';
-  all('.page').forEach(el=>el.hidden=el.id!==`${page}-page`);
-  all('[data-page]').forEach(el=>{el.classList.toggle('active',el.dataset.page===page);if(el.dataset.page===page)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');});
-  $('#breadcrumb').textContent=page[0].toUpperCase()+page.slice(1);
-  $('#page-title').innerHTML=`${{overview:'Audit overview',findings:'Your findings',coverage:'Audit coverage',settings:'Your settings'}[page]}<span>.</span>`;
-  $('#page-subtitle').textContent={overview:'A clearer picture of your website’s exposure.',findings:'Look at the evidence. Decide what needs attention.',coverage:'Know what was scanned, and what was left unseen.',settings:'Set your scope. Choose your model. Make it yours.'}[page];
-  document.title=`gilbrt — ${$('#breadcrumb').textContent}`;
+function notify(message) {
+  clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false;
+  toastTimer = setTimeout(() => $('#toast').hidden = true, 4000);
+}
+function connection(ok, message = '') {
+  connected = ok;
+  $('#engine-status').className = `engine-status ${ok ? 'ready' : 'disconnected'}`;
+  $('#engine-status').innerHTML = `<i></i>${ok ? 'Engine connected' : 'Engine unavailable'}`;
+  $('#connection-notice').hidden = ok;
+  $('#connection-message').textContent = message || 'Start gilbrt --gui, then reconnect.';
+  $('#new-audit').disabled = !ok;
+  all('[data-start]').forEach(button => button.disabled = !ok);
+  $('#settings-form button[type=submit]').disabled = !ok;
+}
+function navigate(page) {
+  if (!['overview','findings','coverage','settings'].includes(page)) page = 'overview';
+  all('.page').forEach(element => element.hidden = element.id !== `${page}-page`);
+  all('[data-page]').forEach(element => {
+    const active = element.dataset.page === page;
+    element.classList.toggle('active', active);
+    if (active) element.setAttribute('aria-current','page'); else element.removeAttribute('aria-current');
+  });
+  const title = {overview:'Audit',findings:'Findings',coverage:'Resources',settings:'Settings'}[page];
+  $('#page-title').innerHTML = `${title}<span>.</span>`;
+  $('#breadcrumb').textContent = title.toLowerCase();
+  $('#page-description').textContent = {overview:'Website source, headers and TLS.',findings:'Evidence and remediation.',coverage:'Scanned resources and coverage notes.',settings:'Defaults for your next audit.'}[page];
+  document.title = `gilbrt — ${title}`;
   window.scrollTo(0,0);
 }
-function rows(findings){return findings.map(f=>`<button class="finding-row" data-finding="${f.index}"><span class="pill" style="--color:${severityColor[f.severity]||'var(--blue)'}">${safe(f.severity.toUpperCase())}</span><span><span class="finding-title">${safe(f.title)}</span><span class="finding-meta">${safe(f.url)}</span></span><span class="finding-category">${safe(f.category)}</span><span class="row-open" aria-hidden="true">›</span></button>`).join('');}
-function indexedFindings(){return (report?.findings||[]).map((f,index)=>({...f,index}));}
-function renderFindings(){
-  const findings=indexedFindings(),query=$('#search').value.trim().toLowerCase(),severity=$('#severity').value;
-  const filtered=findings.filter(f=>(severity==='all'||f.severity===severity)&&[f.title,f.category,f.evidence,f.url].join(' ').toLowerCase().includes(query));
-  $('#results-count').textContent=`${filtered.length} of ${findings.length} findings · values redacted`;
-  $('#all-findings').innerHTML=rows(filtered)||`<p class="empty">${report?'No matching findings. Try another search or severity.':'Start an authorized audit to see findings.'}</p>`;
+function findings() { return report?.findings || []; }
+function badge(severity) { return `<span class="badge ${escapeHTML(severity.toLowerCase())}">${escapeHTML(severity)}</span>`; }
+function findingRows(items) {
+  return items.map(finding => `<button class="finding-row" data-finding="${finding.index}">${badge(finding.severity)}<span class="finding-copy"><span class="finding-title">${escapeHTML(finding.title)}</span><span class="finding-meta">${escapeHTML(finding.url)}</span></span><span class="finding-category">${escapeHTML(finding.category)}</span>${icon('chevron')}</button>`).join('');
 }
-function render(){
-  const findings=indexedFindings(),meta=report?.metadata||{},inventory=meta.resource_inventory||[];
-  const coverage=findings.filter(f=>f.category==='Coverage'),critical=findings.filter(f=>f.severity==='Critical'),warnings=findings.filter(f=>f.severity==='Warning');
-  const attempted=meta.resources_attempted||0,scanned=meta.resources_scanned||0;
-  const risk=$('.score-card .ring');
-  const state=!report?['WAIT','mint',0]:critical.length?['HIGH','red',72]:warnings.length?['MED','blue',45]:['INFO','mint',15];
-  risk.className=`ring ${state[1]}`;risk.style.setProperty('--value',state[2]);risk.querySelector('strong').textContent=state[0];risk.querySelector('div>span').textContent='PRIORITY';
-  $('.score-card .score-copy').innerHTML=`<span class="pill ${state[1]}">${report?(critical.length?'ACTION NEEDED':warnings.length?'REVIEW NEEDED':'CHECK COVERAGE'):'READY WHEN YOU ARE'}</span><p>${report?(critical.length?'Review critical findings first.':'Read findings and coverage together.'):'Start your first authorized audit.'}</p><small>${report?`${critical.length} critical candidate${critical.length===1?'':'s'}`:'No requests made yet'}</small>`;
-  $('.score-card .card-foot').innerHTML='<span>Severity indicates review priority</span><span>Not a security rating</span>';
-  const coverageCard=all('.score-card')[1],percent=attempted?Math.round(scanned/attempted*100):null;
-  coverageCard.querySelector('.ring').style.setProperty('--value',percent||0);
-  coverageCard.querySelector('.ring strong').innerHTML=percent===null?'—':`${percent}<span>%</span>`;
-  coverageCard.querySelector('.score-copy').innerHTML=`<span class="pill mint">${scanned} OF ${attempted} ATTEMPTED</span><p>${report?(coverage.length?'Review coverage gaps.':'Bounded to your selected scope.'):'Coverage appears after an audit.'}</p><small>${coverage.length} coverage observations</small>`;
-  coverageCard.querySelector('.card-foot').innerHTML='<span>Attempted resources only</span><button data-go="coverage">View coverage</button>';
-  $('#score-count').textContent=report?findings.length:'—';
-  all('.score-card')[2].querySelector('.ring').style.setProperty('--value',report?100:0);
-  all('.score-card')[2].querySelector('.card-foot').innerHTML='<span>Candidates, pending validation</span><button data-go="findings">View findings</button>';
-  $('#nav-count').textContent=findings.length;
-  ['Critical','Warning','Info'].forEach(level=>$(`#${level.toLowerCase()}-count`).textContent=findings.filter(f=>f.severity===level).length);
-  $('#priority-list').innerHTML=rows(findings.slice(0,3))||`<p class="empty">${report?'No recorded findings. Review coverage before drawing conclusions.':'Your findings will appear here after an audit.'}</p>`;
-  $('#insight-copy').textContent=!report?'Start with a website you own or have permission to audit. Your results will stay on this device unless you export them.':critical.length?`Review ${critical.length} critical candidate${critical.length===1?'':'s'} first. Check the recorded evidence and remediation before making changes.`:coverage.length?'This audit has coverage limitations. Read them before interpreting the remaining results.':findings.length?'Review the observations and their remediation. These findings require validation against your application.':'No findings were recorded in the scanned resources. This bounded audit does not establish security.';
-  $('#review-critical').textContent=critical.length?'Review critical':'Review findings';
-  const groupCounts=[findings.filter(f=>['Secret','Password','Connection'].includes(f.category)).length,findings.filter(f=>f.category==='Headers').length,findings.filter(f=>!['Secret','Password','Connection','Headers','Coverage'].includes(f.category)).length];
-  all('.check-stat').forEach((el,index)=>{el.querySelector('strong').textContent=groupCounts[index];el.querySelector('i').style.width=`${findings.length?groupCounts[index]/findings.length*100:0}%`;});
-  all('.check-stat')[2].querySelector('span').textContent='Other checks';
-  const ai=meta.local_ai;
-  $('.checks-note').innerHTML=`<span>Local AI</span><span>${!report?'Not started':ai?.enabled?`${safe(ai.backend)} · ${ai.chunks_analyzed} reviewed${ai.failed?' · errors':''}`:ai?.requested?'Requested · skipped':'Not requested'}</span>`;
-  const origin=report?.session?.target_origin;
-  $('#target-name').textContent=origin||'No completed audit';
-  $('#target-meta').textContent=report?`${meta.active?'ACTIVE':'PASSIVE'} AUDIT · ${scanned} RESOURCES · ${meta.robots_respected?'ROBOTS RESPECTED':'ROBOTS OVERRIDE'}`:'START AN AUTHORIZED AUDIT';
-  $('#target-status').innerHTML=`<i></i> ${job&&['running','cancelling'].includes(job.status)?'Audit running':report?'Audit complete':'Ready to audit'}`;
-  const stats=$('.coverage-stats');
-  stats.innerHTML=[[scanned,'Scanned'],[attempted,'Attempted'],[meta.max_pages??'—','Resource cap'],[coverage.length,'Coverage notes']].map(([value,label])=>`<div><strong>${value}</strong><span>${label}</span></div>`).join('');
-  $('.coverage-content .panel-heading .pill').textContent=`${scanned} / ${attempted} ATTEMPTED`;
-  $('.coverage-warning').innerHTML=`<strong>${report?'Keep the boundaries in mind.':'No coverage data yet.'}</strong><p>${report?`This passive audit does not execute JavaScript or crawl authenticated pages. Depth ${meta.max_depth}, resource limit ${meta.max_pages}, per-resource cap ${meta.max_resource_mb} MiB. ${meta.hibp_queried?'HIBP catalogue queried.':'HIBP catalogue not queried.'} Coverage percentage describes attempted resources, not the whole website.`:'Start an authorized audit. There is no sample data in this interface.'}</p>`;
-  $('#resource-list').innerHTML=inventory.map(item=>`<div class="resource-row"><strong>${safe(item.resource)}</strong><span>${safe(item.kind)} · HTTP ${item.status} · ${(item.bytes/1024).toFixed(1)} KiB</span></div>`).join('')+coverage.map(f=>`<div class="coverage-note"><strong>${safe(f.title)}</strong><p>${safe(f.evidence)}</p><p>${safe(f.remediation)}</p></div>`).join('');
-  $('#elapsed').textContent=report?`${Number(report.session.elapsed).toFixed(1)}s TOTAL`:'NO SESSION';
-  for(const id of ['export-top','export-results'])$(`#${id}`).disabled=!report;
-  renderActivity();renderFindings();
+function pagination(prefix, total, page) {
+  $(`#${prefix}-pagination`).hidden = total <= PAGE_SIZE;
+  $(`#${prefix}-prev`).disabled = page === 0;
+  $(`#${prefix}-next`).disabled = (page+1)*PAGE_SIZE >= total;
+  $(`#${prefix}-page`).textContent = `${page+1} / ${Math.max(1, Math.ceil(total/PAGE_SIZE))}`;
 }
-function renderActivity(){
-  const events=job?.events||[];
-  $('#activity-events').innerHTML=events.length?events.slice(-6).reverse().map(event=>`<div><span>${Number(event.elapsed).toFixed(1)}s</span><strong>${safe(event.stage)}</strong>${event.resource?`<small>${safe(event.resource)}</small>`:''}</div>`).join(''):'<p>No audit yet. Start an authorized audit to see activity.</p>';
+function renderFindings() {
+  const query = $('#search').value.trim().toLowerCase(), severity = $('#severity').value, category = $('#category').value;
+  const selected = findings().filter(finding => (severity === 'all' || finding.severity === severity) && (category === 'all' || finding.category === category) && (!query || [finding.title,finding.category,finding.evidence,finding.url].some(value => value.toLowerCase().includes(query))));
+  findingPage = Math.min(findingPage, Math.max(0,Math.ceil(selected.length/PAGE_SIZE)-1));
+  $('#results-count').textContent = `${selected.length} ${selected.length === 1 ? 'finding' : 'findings'}${selected.length !== findings().length ? ` of ${findings().length}` : ''}`;
+  $('#all-findings').innerHTML = findingRows(selected.slice(findingPage*PAGE_SIZE, (findingPage+1)*PAGE_SIZE)) || `<p class="list-empty">${report ? 'No matching findings.' : 'Run an audit to see findings.'}</p>`;
+  $('#clear-filters').hidden = !query && severity === 'all' && category === 'all';
+  pagination('finding',selected.length,findingPage);
 }
-function showFinding(index){
-  const f=report?.findings[index];if(!f)return;
-  $('#detail-severity').className='pill';$('#detail-severity').style.setProperty('--color',severityColor[f.severity]);$('#detail-severity').textContent=f.severity.toUpperCase();
-  $('#detail-title').textContent=f.title;$('#detail-category').textContent=`${f.category} · review candidate`;
-  $('#detail-evidence').textContent=f.evidence;$('#detail-resource').textContent=f.url;$('#detail-remediation').textContent=f.remediation;
-  $('#finding-dialog').showModal();
+function renderResources() {
+  const meta = report?.metadata || {}, items = meta.resource_inventory || [], local = meta.mode === 'files';
+  resourcePage = Math.min(resourcePage, Math.max(0,Math.ceil(items.length/PAGE_SIZE)-1));
+  $('#coverage-total').textContent = report ? `${items.length} scanned` : '';
+  $('#coverage-note').textContent = !report ? 'Run an audit to see resources.' : local ? 'Selected files only. Headers, TLS and breach checks are unavailable.' : `${meta.resources_scanned} scanned of ${meta.resources_attempted ?? items.length} attempted. JavaScript is not executed; authenticated pages are not crawled.`;
+  $('#resource-list').innerHTML = items.slice(resourcePage*PAGE_SIZE,(resourcePage+1)*PAGE_SIZE).map(item => `<div class="resource-row"><strong>${escapeHTML(item.resource)}</strong><span>${escapeHTML(item.kind)}${item.status == null ? '' : ` · HTTP ${Number(item.status)}`}</span><small>${(Number(item.bytes)/1024).toFixed(1)} KiB</small></div>`).join('') || '<p class="list-empty">No scanned resources.</p>';
+  const notes = findings().filter(finding => finding.category === 'Coverage');
+  $('#coverage-observations').hidden = !notes.length;
+  $('#coverage-list').innerHTML = notes.map(finding => `<article class="coverage-note"><h3>${escapeHTML(finding.title)}</h3><p>${escapeHTML(finding.evidence)}</p><p>${escapeHTML(finding.remediation)}</p></article>`).join('');
+  pagination('resource',items.length,resourcePage);
 }
-function renderChecks(container,selected){$(container).innerHTML=checks.map(check=>`<label><input type="checkbox" value="${safe(check)}" ${selected.includes(check)?'checked':''}> ${safe(names[check]||check)}</label>`).join('');}
-function setModelOptions(selector,value){
-  const list=[...models];if(value&&!list.some(m=>m.id===value))list.push({id:value,name:`${value} · unavailable`});
-  $(selector).innerHTML=list.map(model=>`<option value="${safe(model.id)}" ${model.id===value?'selected':''}>${safe(model.name)}</option>`).join('');
+function renderActivity() {
+  $('#activity-events').innerHTML = (job?.events || []).slice(-8).reverse().map(event => `<div><span>${Number(event.elapsed).toFixed(1)}s</span><strong>${escapeHTML(event.stage)}</strong></div>`).join('') || '<p class="field-hint">No activity recorded.</p>';
 }
-function fillSettings(){
-  const form=$('#settings-form');
-  for(const [name,value]of Object.entries(settings)){const field=form.elements.namedItem(name);if(!field)continue;if(field.type==='checkbox')field.checked=value;else field.value=value??'';}
-  renderChecks('#settings-checks',settings.checks);setModelOptions('#settings-model',settings.model);$('#settings-error').textContent='';
-  $('#export-results').textContent=`Export ${settings.export_format==='ai'?'AI Markdown':settings.export_format.toUpperCase()}`;
+function render() {
+  $('#empty-state').hidden = !!report; $('#audit-results').hidden = !report;
+  $('#export-top').disabled = !report || !connected;
+  $('#nav-count').textContent = findings().length; $('#nav-count').hidden = !findings().length;
+  for (const severity of ['Critical','Warning','Info']) $(`#${severity.toLowerCase()}-count`).textContent = findings().filter(finding => finding.severity === severity).length;
+  if (report) {
+    const meta = report.metadata, local = meta.mode === 'files', assessment = report.assessment || {};
+    $('#target-name').textContent = report.session?.target_origin || meta.target;
+    $('#session-icon use').setAttribute('href',local ? '#i-files' : '#i-globe');
+    $('#target-meta').textContent = local ? 'Local files · static source inspection' : `Passive website audit · ${meta.robots_respected ? 'robots.txt respected' : 'robots.txt override'}`;
+    $('#target-status').textContent = assessment.status === 'source_scan_failed' ? 'No source scanned' : assessment.status === 'partial' ? 'Partial coverage' : 'Finished';
+    $('#resource-count').textContent = meta.resources_scanned;
+    $('#resource-summary').textContent = `${meta.resources_attempted ?? meta.resources_scanned} attempted`;
+    $('#assessment').hidden = !['source_scan_failed','partial'].includes(assessment.status);
+    $('#assessment').textContent = assessment.status === 'source_scan_failed' ? 'No source scanned. Review Resources for errors.' : 'Coverage is incomplete. Review Resources before interpreting the findings.';
+    $('#priority-list').innerHTML = findingRows(findings().slice(0,5)) || '<p class="list-empty">No findings in the scanned resources.</p>';
+    const ai = meta.local_ai || {}, duration = Number(report.session?.elapsed || 0).toFixed(1);
+    const details = [['Source',local ? 'Local files' : 'Website'],['Duration',`${duration}s`],['Checks',(meta.search_categories || []).filter(check => check !== 'local-ai').length],['Model',ai.enabled ? `${ai.backend} · ${ai.chunks_analyzed} reviewed` : ai.requested ? 'Skipped' : 'Off']];
+    if (ai.failed) details.push(['Model status','Review failed']);
+    if (!local) details.push(['Resource limit',meta.max_pages]);
+    $('#run-details').innerHTML = details.map(([label,value]) => `<div><dt>${label}</dt><dd>${escapeHTML(value)}</dd></div>`).join('');
+  }
+  const selectedCategory = $('#category').value;
+  $('#category').innerHTML = '<option value="all">All categories</option>' + [...new Set(findings().map(finding => finding.category))].sort().map(category => `<option value="${escapeHTML(category)}">${escapeHTML(category)}</option>`).join('');
+  $('#category').value = [...$('#category').options].some(option => option.value === selectedCategory) ? selectedCategory : 'all';
+  renderFindings(); renderResources(); renderActivity();
 }
-async function refreshModels(){
-  const button=$('#refresh-models');button.disabled=true;$('#model-status').textContent='Checking installed local models…';
-  const selected=$('#settings-model').value;
-  try{
-    const data=await api(`/api/models?url=${encodeURIComponent($('#ollama-url').value)}`);
-    models=data.choices;setModelOptions('#settings-model',selected);setModelOptions('#audit-model',$('#audit-model').value||settings.model);
-    $('#model-status').textContent=`${data.status}${data.available_memory_bytes?` Available RAM: ${(data.available_memory_bytes/1024**3).toFixed(1)} GiB.`:''}`;
-    $('#model-catalogue').innerHTML=data.catalogue.map(model=>`<div><span>${safe(model.id)}</span><small>~${safe(model.download)} · ${model.ram_gib} GiB available RAM estimate</small></div>`).join('');
-  }catch(error){$('#model-status').textContent=error.message;}finally{button.disabled=false;}
+function acceptReport(data) {
+  if (!Object.hasOwn(data,'report')) return;
+  report = data.report; reportId = data.report_id || ''; findingPage = 0; resourcePage = 0;
+  report?.findings.forEach((finding,index) => finding.index = index);
 }
-function readSettings(){
-  const form=$('#settings-form'),result={...settings};
-  for(const key of ['max_pages','max_depth','max_resource_mb','rate_limit','ai_candidate_limit'])result[key]=Number(form.elements.namedItem(key).value);
-  const budget=form.elements.namedItem('ai_max_chunks').value;result.ai_max_chunks=budget===''?null:Number(budget);
-  for(const key of ['model','ollama_url','export_format'])result[key]=form.elements.namedItem(key).value;
-  result.ignore_robots=form.elements.namedItem('ignore_robots').checked;result.checks=all('#settings-checks input:checked').map(el=>el.value);return result;
+function renderChecks(selector, selected) {
+  $(selector).innerHTML = checks.map(check => {
+    const disabled = selector === '#audit-checks' && mode === 'files' && !sourceChecks.includes(check);
+    return `<label class="${disabled ? 'disabled' : ''}"><input type="checkbox" value="${escapeHTML(check)}" ${selected.includes(check) && !disabled ? 'checked' : ''} ${disabled ? 'disabled' : ''}><span>${escapeHTML(checkNames[check] || check)}</span></label>`;
+  }).join('');
 }
-async function saveSettings(event){
-  event.preventDefault();$('#settings-error').textContent='';const button=$('#settings-form button[type=submit]');button.disabled=true;
-  try{const result=await api('/api/settings',readSettings());settings=result.settings;fillSettings();notify('Settings saved for future audits.');}catch(error){$('#settings-error').textContent=error.message;}finally{button.disabled=false;}
+function setModels(selector,value) {
+  const list = [...models];
+  if (value && !list.some(model => model.id === value)) list.push({id:value,name:`${value} (unavailable)`});
+  $(selector).innerHTML = list.map(model => `<option value="${escapeHTML(model.id)}">${escapeHTML(model.name)}</option>`).join('');
+  $(selector).value = value;
 }
-function openSetup(){
-  if(!connected)return notify('The local engine is unavailable. Reload after restarting gilbrt --gui.');
-  if(job&&['running','cancelling'].includes(job.status)){updateScan();$('#scan-dialog').showModal();return;}
-  renderChecks('#audit-checks',settings.checks);setModelOptions('#audit-model',settings.model);$('#authorization').checked=false;
-  $('#form-error').textContent='';$('#audit-config-summary').textContent=`${settings.max_pages} resources · depth ${settings.max_depth} · ${settings.rate_limit}s delay · ${settings.max_resource_mb} MiB per resource. Change defaults in Settings.`;
+function fillSettings() {
+  for (const [name,value] of Object.entries(settings)) {
+    const field = $('#settings-form').elements.namedItem(name); if (!field) continue;
+    if (field.type === 'checkbox') field.checked = value; else field.value = value ?? '';
+  }
+  renderChecks('#settings-checks',settings.checks); setModels('#settings-model',settings.model);
+}
+async function refreshModels() {
+  const button = $('#refresh-models'); button.disabled = true; $('#model-status').textContent = 'Checking local models…';
+  try {
+    const data = await api(`/api/models?url=${encodeURIComponent($('#ollama-url').value)}`);
+    models = data.choices;
+    setModels('#settings-model',$('#settings-model').value);
+    setModels('#audit-model',$('#audit-model').value || settings.model);
+    const installed = models.length-1;
+    $('#model-status').textContent = installed ? `${installed} installed ${installed === 1 ? 'model' : 'models'}.${data.available_memory_bytes ? ` ${(data.available_memory_bytes/1024**3).toFixed(1)} GiB available RAM.` : ''}` : 'No installed models. Static checks are available.';
+  } catch (error) { $('#model-status').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+function readSettings() {
+  const form = $('#settings-form'), result = {...settings};
+  for (const key of ['max_pages','max_depth','max_resource_mb','rate_limit','ai_candidate_limit']) result[key] = Number(form.elements.namedItem(key).value);
+  result.ai_max_chunks = form.elements.namedItem('ai_max_chunks').value === '' ? null : Number(form.elements.namedItem('ai_max_chunks').value);
+  for (const key of ['model','ollama_url','export_format']) result[key] = form.elements.namedItem(key).value;
+  result.ignore_robots = form.elements.namedItem('ignore_robots').checked;
+  result.checks = all('#settings-checks input:checked').map(input => input.value);
+  return result;
+}
+async function saveSettings(event) {
+  event.preventDefault(); const button = $('#settings-form button[type=submit]'); button.disabled = true;
+  $('#settings-error').textContent = '';
+  try { settings = (await api('/api/settings',readSettings())).settings; fillSettings(); notify('Settings saved.'); }
+  catch (error) { $('#settings-error').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+function selectMode(value) {
+  const selected = all('#audit-checks input:checked').map(input => input.value);
+  mode = value;
+  all('[data-mode]').forEach(button => button.setAttribute('aria-pressed',String(button.dataset.mode === mode)));
+  $('#website-fields').hidden = mode !== 'website'; $('#file-fields').hidden = mode !== 'files';
+  $('#target').required = mode === 'website'; $('#target').disabled = mode !== 'website';
+  $('#source-files').required = mode === 'files'; $('#source-files').disabled = mode !== 'files';
+  $('#extra-resources').hidden = mode === 'files';
+  $('#authorization-label').textContent = mode === 'files' ? 'I own these files or have permission to inspect them.' : 'I own this website or have permission to audit it.';
+  renderChecks('#audit-checks',selected.length ? selected : settings.checks);
+  $('#audit-config-summary').textContent = mode === 'files' ? `${settings.max_pages} file limit · ${settings.max_resource_mb} MiB per file · no website requests` : `${settings.max_pages} resources · depth ${settings.max_depth} · ${settings.rate_limit}s delay`;
+}
+function openSetup() {
+  if (!connected) return notify('Start gilbrt --gui, then reconnect.');
+  if (job && ['running','cancelling'].includes(job.status)) { updateScan(); $('#scan-dialog').showModal(); return; }
+  renderChecks('#audit-checks',settings.checks); selectMode(mode); setModels('#audit-model',settings.model);
+  $('#form-error').textContent = ''; $('#authorization').checked = false;
   $('#setup-dialog').showModal();
 }
-async function startAudit(event){
-  event.preventDefault();const button=$('#start-audit');button.disabled=true;$('#form-error').textContent='';
-  try{
-    const options={...settings,model:$('#audit-model').value,checks:all('#audit-checks input:checked').map(el=>el.value)};
-    const data=await api('/api/audit',{target:$('#target').value,authorized:$('#authorization').checked,settings:options,include_urls:$('#include-urls').value.split('\n').map(x=>x.trim()).filter(Boolean)});
-    job=data.job;$('#setup-dialog').close();updateScan();$('#scan-dialog').showModal();render();schedulePoll();
-  }catch(error){$('#form-error').textContent=error.message;}finally{button.disabled=false;}
+async function startAudit(event) {
+  event.preventDefault(); const button = $('#start-audit'); button.disabled = true; $('#form-error').textContent = '';
+  const selectedMode = mode;
+  try {
+    const options = {...settings,model:$('#audit-model').value,checks:all('#audit-checks input:checked').map(input => input.value)};
+    if (!options.checks.length) throw Error('Select at least one check.');
+    const data = {authorized:$('#authorization').checked,settings:options};
+    if (selectedMode === 'files') {
+      const files = [...$('#source-files').files];
+      if (!files.length || files.length > 100) throw Error('Choose 1–100 source files.');
+      if (files.reduce((total,file) => total+file.size,0) > 16*1024**2) throw Error('Selected files exceed 16 MiB.');
+      data.files = await Promise.all(files.map(async file => ({name:file.name,content:await file.text()})));
+      if (new TextEncoder().encode(JSON.stringify(data)).length > 32*1024**2) throw Error('Encoded files exceed the upload limit. Select fewer files.');
+    } else {
+      data.target = $('#target').value;
+      data.include_urls = $('#include-urls').value.split('\n').map(line => line.trim()).filter(Boolean);
+    }
+    const response = await api(selectedMode === 'files' ? '/api/offline' : '/api/audit',data);
+    job = response.job; $('#setup-dialog').close(); updateScan(); $('#scan-dialog').showModal(); schedulePoll(300);
+  } catch (error) { $('#form-error').textContent = error.message; }
+  finally { button.disabled = false; }
 }
-function updateScan(){
-  if(!job)return;
-  try{$('#scan-target').textContent=new URL(job.target).origin;}catch{$('#scan-target').textContent='Authorized scope';}
-  $('#scan-stage').textContent=job.stage;$('#scan-percent').textContent=`${job.resources_scanned} scanned`;
-  $('#scan-log').innerHTML=(job.events||[]).slice(-4).map(event=>`<div>${Number(event.elapsed).toFixed(1)}s · ${safe(event.stage)}${event.batch?` · batch ${event.batch}`:''}</div>`).join('');
-  $('#cancel-scan').disabled=job.status==='cancelling';$('#cancel-scan').textContent=job.status==='cancelling'?'Stopping…':'Cancel audit';
+function updateScan() {
+  if (!job) return;
+  $('#scan-target').textContent = job.mode === 'files' ? 'Local source files' : (() => {try { return new URL(job.target).origin; } catch { return 'Website'; }})();
+  $('#scan-stage').textContent = job.stage;
+  $('#scan-count').textContent = `${job.resources_scanned} scanned`;
+  $('#scan-log').innerHTML = (job.events || []).slice(-5).map(event => `<div>${Number(event.elapsed).toFixed(1)}s · ${escapeHTML(event.stage)}${event.batch ? ` · batch ${event.batch}` : ''}</div>`).join('');
+  $('#cancel-scan').disabled = job.status === 'cancelling'; $('#cancel-scan').textContent = job.status === 'cancelling' ? 'Stopping…' : 'Cancel audit';
 }
-function schedulePoll(delay=650){clearTimeout(pollTimer);pollTimer=setTimeout(poll,delay);}
-async function poll(){
-  try{
-    const data=await api('/api/state');connected=true;job=data.job;report=data.report;
-    if(job&&['running','cancelling'].includes(job.status)){updateScan();renderActivity();$('#target-status').innerHTML='<i></i> Audit running';schedulePoll();return;}
-    if($('#scan-dialog').open)$('#scan-dialog').close();
-    const terminal=job?`${job.id}:${job.status}`:'';
-    if(terminal&&terminal!==lastTerminal){lastTerminal=terminal;render();if(job.status==='complete'){location.hash='overview';notify(`Audit complete. ${report.findings.length} observations recorded.`);}else notify(job.error||'Audit cancelled. Previous completed results retained.');}
-  }catch(error){connected=false;$('#scan-stage').textContent='Connection lost. Waiting for the local engine…';$('#cancel-scan').disabled=false;notify(error.message||'Connection to the local engine was lost.');schedulePoll(3000);}
+function schedulePoll(delay = document.hidden ? 3500 : 800) { clearTimeout(pollTimer); pollTimer = setTimeout(poll,delay); }
+async function poll() {
+  try {
+    const data = await api(`/api/state?report_id=${encodeURIComponent(reportId)}`);
+    connection(true); job = data.job; acceptReport(data);
+    if (job && ['running','cancelling'].includes(job.status)) { updateScan(); renderActivity(); schedulePoll(); return; }
+    if ($('#scan-dialog').open) $('#scan-dialog').close();
+    const terminal = job ? `${job.id}:${job.status}` : '';
+    if (terminal && terminal !== lastTerminal) {
+      lastTerminal = terminal; render();
+      if (job.status === 'complete') { location.hash = 'overview'; navigate('overview'); notify('Audit finished.'); }
+      else notify(job.status === 'cancelled' ? 'Audit cancelled.' : job.error || 'Audit failed.');
+    }
+  } catch (error) { connection(false,error.message); $('#scan-stage').textContent = 'Engine disconnected'; }
 }
-async function cancelAudit(){
-  if(!job||!['running','cancelling'].includes(job.status))return;
-  try{const data=await api('/api/cancel',{});job=data.job;updateScan();schedulePoll();}catch(error){notify(error.message);}
+async function cancelAudit() {
+  if (!job || !['running','cancelling'].includes(job.status)) return;
+  try { job = (await api('/api/cancel',{})).job; updateScan(); schedulePoll(300); }
+  catch (error) { connection(false,error.message); }
 }
-async function exportReport(){
-  if(!report)return;try{
-    const fmt=settings.export_format,response=await fetch(`/api/export?format=${fmt}`,{headers:{'X-Gilbrt-Token':token}});
-    if(!response.ok){const data=await response.json();throw Error(data.error);}
-    const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`gilbrt-report.${fmt==='ai'?'md':fmt}`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);notify('Redacted report exported.');
-  }catch(error){notify(error.message);}
+function showFinding(index) {
+  const finding = report?.findings[index]; if (!finding) return;
+  detailIndex = index; evidenceRequest++;
+  $('#detail-severity').className = `badge ${finding.severity.toLowerCase()}`;
+  $('#detail-severity').textContent = finding.severity;
+  $('#detail-title').textContent = finding.title; $('#detail-category').textContent = finding.category;
+  $('#detail-evidence').textContent = finding.evidence; $('#detail-resource').textContent = finding.url;
+  $('#detail-remediation').textContent = finding.remediation;
+  $('#reveal-evidence').hidden = !['Password','Access code','Secret','Connection','Local AI'].includes(finding.category);
+  $('#reveal-evidence').disabled = false;
+  $('#reveal-evidence').innerHTML = `${icon('eye')}Show matched value`;
+  $('#finding-dialog').showModal();
 }
-document.addEventListener('click',event=>{
-  const finding=event.target.closest('[data-finding]');if(finding)showFinding(Number(finding.dataset.finding));
-  const go=event.target.closest('[data-go]');if(go)location.hash=go.dataset.go;
-  const close=event.target.closest('[data-close]');if(close)close.closest('dialog').close();
+async function revealEvidence() {
+  const request = ++evidenceRequest, button = $('#reveal-evidence'); button.disabled = true;
+  try {
+    const data = await api(`/api/evidence?report_id=${encodeURIComponent(reportId)}&index=${detailIndex}`);
+    if (request !== evidenceRequest || !$('#finding-dialog').open) return;
+    $('#detail-evidence').textContent = data.evidence;
+    button.textContent = 'Value shown locally';
+  } catch (error) { if (request === evidenceRequest) { button.disabled = false; notify(error.message); } }
+}
+async function downloadReport() {
+  const button = $('#download-report'); button.disabled = true;
+  try {
+    const format = $('#export-format').value;
+    const response = await fetch(`/api/export?format=${format}`,{headers:{'X-Gilbrt-Token':token},signal:AbortSignal.timeout(15000)});
+    if (!response.ok) throw Error((await response.json()).error || 'Export failed.');
+    const url = URL.createObjectURL(await response.blob()), link = document.createElement('a');
+    link.href = url; link.download = `gilbrt-report.${format === 'ai' ? 'md' : format}`; link.click();
+    setTimeout(() => URL.revokeObjectURL(url),1000); $('#export-dialog').close(); notify('Report exported.');
+  } catch (error) { notify(error.message); } finally { button.disabled = false; }
+}
+async function initialize() {
+  if (booting) return; booting = true; clearTimeout(pollTimer);
+  try {
+    const response = await fetch('/api/bootstrap',{signal:AbortSignal.timeout(10000)});
+    const data = await response.json(); if (!response.ok) throw Error(data.error || 'Engine unavailable.');
+    token = data.token; settings = data.settings; checks = data.checks;
+    sourceChecks = data.content_checks || checks.filter(check => !['headers','tls','breaches'].includes(check));
+    job = data.job; acceptReport(data); connection(true); fillSettings(); render();
+    $('#hibp-status').textContent = data.hibp_available ? 'Breach catalogue uses HIBP and requires internet.' : 'Breach catalogue requires internet and HIBP_API_KEY.';
+    refreshModels();
+    if (job && ['running','cancelling'].includes(job.status)) { updateScan(); if (!$('#scan-dialog').open) $('#scan-dialog').showModal(); schedulePoll(); }
+    else { if ($('#scan-dialog').open) $('#scan-dialog').close(); lastTerminal = job ? `${job.id}:${job.status}` : ''; }
+  } catch (error) { connection(false,error.message); } finally { booting = false; }
+}
+
+document.addEventListener('click',event => {
+  const finding = event.target.closest('[data-finding]'); if (finding) showFinding(Number(finding.dataset.finding));
+  const go = event.target.closest('[data-go]'); if (go) location.hash = go.dataset.go;
+  const severity = event.target.closest('[data-severity]');
+  if (severity) { $('#severity').value = severity.dataset.severity; $('#search').value = ''; $('#category').value = 'all'; findingPage = 0; renderFindings(); location.hash = 'findings'; }
+  const close = event.target.closest('[data-close]'); if (close) close.closest('dialog').close();
+  const start = event.target.closest('[data-start]'); if (start) openSetup();
+  const source = event.target.closest('[data-mode]'); if (source) selectMode(source.dataset.mode);
 });
-window.addEventListener('hashchange',()=>navigate(location.hash.slice(1)));
-$('#search').addEventListener('input',renderFindings);$('#severity').addEventListener('change',renderFindings);
-$('#new-audit').addEventListener('click',openSetup);$('#setup-form').addEventListener('submit',startAudit);
-$('#settings-form').addEventListener('submit',saveSettings);$('#refresh-models').addEventListener('click',refreshModels);
-$('#cancel-scan').addEventListener('click',cancelAudit);$('#scan-dialog').addEventListener('cancel',event=>{event.preventDefault();cancelAudit();});
-$('#review-critical').addEventListener('click',()=>{$('#search').value='';$('#severity').value=report?.findings.some(f=>f.severity==='Critical')?'Critical':'all';renderFindings();location.hash='findings';});
-for(const id of ['about','avatar'])$(`#${id}`).addEventListener('click',()=>$('#about-dialog').showModal());
-for(const id of ['export-top','export-results'])$(`#${id}`).addEventListener('click',exportReport);
-$('#reset-settings').addEventListener('click',()=>{
-  const form=$('#settings-form');for(const[name,value]of Object.entries({max_pages:25,max_depth:2,max_resource_mb:16,rate_limit:1,ollama_url:'http://127.0.0.1:11434',ai_max_chunks:'',ai_candidate_limit:256,export_format:'json',model:''}))form.elements.namedItem(name).value=value;
-  form.elements.namedItem('ignore_robots').checked=false;renderChecks('#settings-checks',checks);notify('Defaults restored in the form. Save to apply.');
-});
-async function initialize(){
-  $('#new-audit').disabled=true;models=[{id:'',name:'Static checks only'}];render();navigate(location.hash.slice(1));
-  try{
-    const response=await fetch('/api/bootstrap');if(!response.ok)throw Error('Unable to connect to the local engine.');const data=await response.json();
-    token=data.token;settings=data.settings;checks=data.checks;job=data.job;report=data.report;connected=true;
-    fillSettings();render();$('#new-audit').disabled=false;
-    $('#hibp-status').textContent=data.hibp_available?'HIBP_API_KEY is available from the server environment. Breach checks use the HIBP catalogue.':'Breach catalogue checks require HIBP_API_KEY in the environment used to launch gilbrt. No key is stored in GUI settings.';
-    await refreshModels();
-    if(job&&['running','cancelling'].includes(job.status)){updateScan();$('#scan-dialog').showModal();schedulePoll();}else lastTerminal=job?`${job.id}:${job.status}`:'';
-  }catch(error){$('#page-subtitle').textContent='Local engine unavailable. Start gilbrt --gui and reload this page.';notify(error.message);}
+window.addEventListener('hashchange',() => { if (location.hash !== '#main') navigate(location.hash.slice(1)); });
+$('#new-audit').addEventListener('click',openSetup);
+$('#setup-form').addEventListener('submit',startAudit);
+$('#settings-form').addEventListener('submit',saveSettings);
+$('#refresh-models').addEventListener('click',refreshModels);
+$('#reconnect').addEventListener('click',initialize);
+$('#cancel-scan').addEventListener('click',cancelAudit);
+$('#scan-dialog').addEventListener('cancel',event => { event.preventDefault(); cancelAudit(); });
+$('#reveal-evidence').addEventListener('click',revealEvidence);
+$('#finding-dialog').addEventListener('close',() => { evidenceRequest++; detailIndex = -1; $('#detail-evidence').textContent = ''; });
+$('#export-top').addEventListener('click',() => { $('#export-format').value = settings.export_format; $('#export-dialog').showModal(); });
+$('#download-report').addEventListener('click',downloadReport);
+for (const id of ['search','severity','category']) $(`#${id}`).addEventListener(id === 'search' ? 'input' : 'change',() => { findingPage = 0; renderFindings(); });
+$('#clear-filters').addEventListener('click',() => { $('#search').value = ''; $('#severity').value = 'all'; $('#category').value = 'all'; findingPage = 0; renderFindings(); });
+for (const [prefix,renderPage] of [['finding',renderFindings],['resource',renderResources]]) {
+  for (const [direction,delta] of [['prev',-1],['next',1]]) $(`#${prefix}-${direction}`).addEventListener('click',() => {
+    if (prefix === 'finding') findingPage = Math.max(0,findingPage+delta); else resourcePage = Math.max(0,resourcePage+delta); renderPage();
+  });
 }
-initialize();
+$('#toggle-checks').addEventListener('click',() => { const inputs = all('#audit-checks input:not(:disabled)'), select = inputs.some(input => !input.checked); inputs.forEach(input => input.checked = select); $('#toggle-checks').textContent = select ? 'Clear all' : 'Select all'; });
+$('#source-files').addEventListener('change',() => { const files = [...$('#source-files').files]; $('#file-summary').textContent = files.length ? `${files.length} files · ${(files.reduce((total,file) => total+file.size,0)/1024).toFixed(1)} KiB` : 'Up to 100 files · 16 MiB combined.'; });
+$('#reset-settings').addEventListener('click',() => {
+  const form = $('#settings-form');
+  for (const [name,value] of Object.entries({max_pages:25,max_depth:2,max_resource_mb:16,rate_limit:1,ollama_url:'http://127.0.0.1:11434',ai_max_chunks:'',ai_candidate_limit:256,export_format:'json',model:''})) form.elements.namedItem(name).value = value;
+  form.elements.namedItem('ignore_robots').checked = false; renderChecks('#settings-checks',checks); notify('Defaults restored. Save to apply.');
+});
+render(); navigate(location.hash.slice(1)); initialize();

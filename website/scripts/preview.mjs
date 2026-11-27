@@ -3,17 +3,28 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import stats from '../api/stats.js';
+import readme from '../api/readme.js';
+import './sync-readme.mjs';
 const root = path.resolve(fileURLToPath(new URL('../public/', import.meta.url)));
-const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json', '.sh': 'text/plain' };
+const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json', '.sh': 'text/plain', '.md': 'text/markdown' };
+// Match production headers during local browser checks.
+const { headers } = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'));
 http.createServer(async (req, res) => {
-  if (new URL(req.url, 'http://localhost').pathname === '/api/stats') {
+  for (const rule of headers) {
+    if (rule.source === '/(.*)' || rule.source === new URL(req.url, 'http://localhost').pathname) {
+      for (const header of rule.headers) res.setHeader(header.key, header.value);
+    }
+  }
+  const pathname = new URL(req.url, 'http://localhost').pathname;
+  const endpoint = { '/api/stats': stats, '/api/readme': readme }[pathname];
+  if (endpoint) {
     res.status = value => { res.statusCode = value; return res; };
     res.json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
-    return stats(req, res);
+    return endpoint(req, res);
   }
   try {
     const pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
-    const filename = path.resolve(root, '.' + (pathname === '/' ? '/index.html' : pathname));
+    const filename = path.resolve(root, '.' + (pathname === '/' ? '/index.html' : pathname === '/install' || pathname === '/install/' ? '/install.html' : pathname));
     if (!filename.startsWith(root + path.sep) && filename !== path.join(root, 'index.html')) { res.writeHead(403); return res.end(); }
     const body = await readFile(filename);
     res.setHeader('Content-Type', `${types[path.extname(filename)] || 'application/octet-stream'}; charset=utf-8`);

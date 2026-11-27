@@ -1,5 +1,13 @@
 {
   "environment": "staging",
+  "http_checks": [
+    {
+      "path": "/",
+      "method": "HEAD",
+      "expected_status": [200],
+      "required_headers": ["Content-Security-Policy", "X-Content-Type-Options"]
+    }
+  ],
   "isolation": [
     {
       "path": "/api/conversations/REPLACE_WITH_SYNTHETIC_RECORD_ID",

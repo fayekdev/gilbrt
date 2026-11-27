@@ -11,10 +11,10 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup, Comment
 
 from .models import Finding
-from .access_codes import credential_literal, detect as detect_access_codes
+from .access_codes import PASSWORD_NAME, credential_literal, detect as detect_access_codes
 
 PATTERNS: dict[str, re.Pattern[str]] = {
-    "OpenAI-style API secret": re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"),
+    "OpenAI-style API secret": re.compile(r"\bsk-(?!ant-)(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"),
     "Anthropic API secret": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
     "Hugging Face token": re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
     "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -184,7 +184,7 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
             if not candidate.confident_name:
                 title = "Hardcoded literal in conditional (review)"
             findings.append(Finding("Critical" if candidate.password else "Warning" if candidate.confident_name else "Info", kind, title, location,
-                                    f"Line {line}; operator {candidate.operator}; {mask(candidate.value)}; static candidate only",
+                                    f"Line {line}; operator {candidate.operator}; {mask(candidate.value)}; {candidate.basis}; static candidate only",
                                     "Move access checks to the server; rotate real exposed access codes. Verify whether this comparison controls access."))
             if on_secret:
                 on_secret(findings[-1], candidate.value)
@@ -209,10 +209,16 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                     password_candidate(value, text.count("\n", 0, match.start()) + 1, "plain-text password field")
         if html:
             soup = BeautifulSoup(text, "html.parser", store_line_numbers=True)
-            visible = soup.get_text(" ", strip=True)
-            for match in PASSWORD.finditer(visible):
-                password_candidate(next(v for v in match.groups() if v is not None), 1,
-                                   "visible HTML text; line approximate")
+            # Do not flatten unrelated labels, links and help text into a fake
+            # password. Only accept a complete short field in a leaf text block.
+            for block in soup.find_all(["p", "div", "li", "dd", "td", "pre", "code"]):
+                if block.find(["p", "div", "li", "dd", "td", "pre", "code", "input", "label", "a", "button"]):
+                    continue
+                visible = block.get_text(" ", strip=True)
+                match = PASSWORD.fullmatch(visible)
+                if match:
+                    password_candidate(next(v for v in match.groups() if v is not None), block.sourceline or 1,
+                                       "visible HTML password field")
             for node in soup.find_all(True):
                 identity = " ".join(str(node.get(k, "")) for k in ("name", "id", "type"))
                 if node.name in {"input", "textarea"} and re.search(r"password|passwd|pwd|\bpass\b", identity, re.I):
@@ -225,6 +231,33 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                 cells = row.find_all(["td", "th"], recursive=False)
                 if len(cells) >= 2 and re.fullmatch(r"(?:[\w.-]*?(?:password|passwd|pwd)|pass)\s*:?", cells[0].get_text(strip=True), re.I):
                     password_candidate(cells[1].get_text(strip=True), row.sourceline or 1, "HTML table password field")
+        # Framework hydration payloads and fetched JSON are data, not JavaScript
+        # programs. Parse them explicitly rather than relying on JS error recovery.
+        json_sources = [str(node.string or node.get_text()) for node in soup.find_all("script")
+                        if node.get("type", "").lower() in {"application/json", "application/ld+json"}] if html else [text]
+        for payload in json_sources:
+            if not payload.lstrip().startswith(("{", "[")):
+                continue
+            try:
+                document = json.loads(payload)
+            except (ValueError, RecursionError):
+                continue
+            pending = [(document, 0)]
+            visited = 0
+            while pending and visited < 10000:
+                item, depth = pending.pop()
+                visited += 1
+                if depth > 32:
+                    continue
+                if isinstance(item, dict):
+                    for name, value in item.items():
+                        normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+                        if PASSWORD_NAME.search(normalized) and type(value) in {str, int} and 1 <= len(str(value)) <= 512:
+                            password_candidate(str(value), 1, "decoded JSON password property; line approximate")
+                        if isinstance(value, (dict, list)):
+                            pending.append((value, depth + 1))
+                elif isinstance(item, list):
+                    pending.extend((value, depth + 1) for value in item[:10000] if isinstance(value, (dict, list)))
     if "api-keys" in enabled or "tokens" in enabled:
         for match in SUPABASE_SERVICE_ROLE.finditer(text):
             value = match.group(1)
@@ -236,23 +269,32 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                                     "Rotate the key immediately if real; service-role keys bypass row-level security and must never be shipped to clients."))
             if on_secret:
                 on_secret(findings[-1], value)
+    provider_sources = [(text, 0)]
+    if enabled & {"api-keys", "tokens", "private-keys"}:
+        from .js_parser import secret_literals
+        # Constant-fold credential-like assignments, then apply the same provider
+        # patterns. Raw source and reconstructed values share the deduplication set.
+        script_sources = [(m.group(1), m.start(1)) for m in re.finditer(r"<script\b[^>]*>([\s\S]*?)</script\s*>", text, re.I)] if html else [(text, 0)]
+        provider_sources.extend((value, text.count("\n", 0, base + offset)) for source, base in script_sources
+                                for value, offset in secret_literals(source))
     for label, pattern in PATTERNS.items():
         if pattern_category(label) not in enabled:
             continue
-        for match in pattern.finditer(text):
-            value = match.group()
-            if (label, value) in seen:
-                continue
-            seen.add((label, value))
-            line = text.count("\n", 0, match.start()) + 1
-            findings.append(Finding(
-                "Warning" if label in {"JWT", "Google API key"} else "Critical",
-                "Secret", f"Potential {label}", location,
-                f"Line {line}; {mask(value)}; static match only",
-                "Verify ownership and intended exposure; rotate exposed credentials and move secrets server-side.",
-            ))
-            if on_secret:
-                on_secret(findings[-1], value)
+        for source, base_line in provider_sources:
+            for match in pattern.finditer(source):
+                value = match.group()
+                if (label, value) in seen:
+                    continue
+                seen.add((label, value))
+                line = base_line + source.count("\n", 0, match.start()) + 1
+                findings.append(Finding(
+                    "Warning" if label in {"JWT", "Google API key"} else "Critical",
+                    "Secret", f"Potential {label}", location,
+                    f"Line {line}; {mask(value)}; static match only",
+                    "Verify ownership and intended exposure; rotate exposed credentials and move secrets server-side.",
+                ))
+                if on_secret:
+                    on_secret(findings[-1], value)
     for match in ASSIGNMENT.finditer(text):
         if "entropy" not in enabled:
             break

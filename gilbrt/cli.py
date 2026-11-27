@@ -1,12 +1,14 @@
 """Argument parsing and authorized audit orchestration."""
 
 import argparse
+import hashlib
 import math
 import os
 import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
@@ -21,8 +23,9 @@ from .menu import select_checks
 from .local_ai import LocalAnalyzer
 from .bundled_ai import BundledAnalyzer, RUNTIME, available as bundled_available
 from .models import Finding
-from .reporter import copy_to_clipboard, export, print_summary, render_report
+from .reporter import assess_findings, copy_to_clipboard, export, print_summary, render_report
 from .scanner import CONTENT_CHECKS, safe_url, scan
+from .scope import ExcludedTarget
 from .updater import update_installation
 
 DEFAULT_CHECKS = ["passwords", "api-keys", "tokens", "private-keys", "entropy", "comments", "endpoints", "headers", "tls", "breaches", "access-codes", "connections", "browser-code", "forms"]
@@ -98,6 +101,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-authorized", action="store_true",
                    help="Confirm explicit authorization to audit this system")
     p.add_argument("--max-depth", type=integer, default=2)
+    p.add_argument("--sitemaps", action="store_true", help="Discover same-origin sitemaps declared in robots.txt within the resource budget")
+    p.add_argument("--exclude-domain", action="append", default=[], metavar="DOMAIN",
+                   help="Add a domain and its subdomains to the built-in do-not-test list; repeatable")
     p.add_argument("--max-resource-mb", type=integer, default=16,
                    help="Maximum decompressed MiB per fetched resource (1-64; default 16)")
     p.add_argument("--max-pages", type=integer, default=25,
@@ -188,6 +194,8 @@ def run_audit(args, selected, progress=None, cancelled=None):
         checkpoint()
         emit("Preparing audit")
         target = normalize(args.url)
+        client = ScopedClient(target, args.rate_limit, max_resource_bytes=args.max_resource_mb * 1024 * 1024,
+                              exclude_domains=getattr(args, "exclude_domain", []))
         setup_findings = []
         if "local-ai" in selected:
             try:
@@ -198,7 +206,6 @@ def run_audit(args, selected, progress=None, cancelled=None):
                 setup_findings.append(Finding("Info", "Coverage", "Optional AI skipped: low available memory", safe_url(target),
                                               "The small model needs at least 768 MiB of available physical memory before starting.",
                                               "Close other applications or run static checks; no model process was started."))
-        client = ScopedClient(target, args.rate_limit, max_resource_bytes=args.max_resource_mb * 1024 * 1024)
         original_pace = client.pace
         def paced():
             checkpoint()
@@ -224,7 +231,8 @@ def run_audit(args, selected, progress=None, cancelled=None):
                 return result
             analyzer.request = checked_request
         config = load_config(args.active_config, client) if args.active else None
-        crawler = Crawler(client, args.max_depth, args.max_pages, args.ignore_robots, args.include_url)
+        crawler = Crawler(client, args.max_depth, args.max_pages, args.ignore_robots, args.include_url,
+                          discover_sitemaps=getattr(args, "sitemaps", False))
         visible_values: dict[int, str] = {}
         def reveal(finding: Finding, value: str) -> None:
             """Keep explicit local reveal separate from redacted findings and exports."""
@@ -232,6 +240,7 @@ def run_audit(args, selected, progress=None, cancelled=None):
         findings = setup_findings
         resources = 0
         resource_inventory = []
+        ai_duplicate_candidates = 0
         if analyzer and args.local_model == "bundled":
             analyzer.progress = lambda batch, remaining: emit("AI review", batch=batch, candidates_pending=remaining)
         # Respect the same pacing clock for TLS, crawl, HIBP and active probes.
@@ -243,16 +252,32 @@ def run_audit(args, selected, progress=None, cancelled=None):
             checkpoint()
             emit("Analyzing resource", resource=safe_url(resource.url), resources_scanned=resources)
             resources += 1
-            resource_inventory.append({"resource": safe_url(resource.url), "status": resource.response.status_code,
-                                       "kind": "HTML" if resource.html else "Client-side content",
-                                       "bytes": len(resource.response.content)})
+            content_type = resource.response.headers.get("Content-Type", "").lower()
+            resource_kind = "HTML" if resource.html else "JavaScript" if "javascript" in content_type or urlsplit(resource.url).path.endswith((".js", ".mjs")) else "JSON" if "json" in content_type else "Client-side content"
+            inventory_entry = {"resource": safe_url(resource.url), "status": resource.response.status_code,
+                                       "kind": resource_kind,
+                                       "bytes": len(resource.response.content)}
+            resource_inventory.append(inventory_entry)
             if "headers" in selected:
                 findings.extend(analyze_headers(resource.response, document=resource.html))
-            findings.extend(scan(resource.body, resource.url, resource.html, selected & CONTENT_CHECKS,
-                                 reveal if args.show_secrets else None))
+            first_content_finding = len(findings)
+            candidate_hashes = {}
+            def remember(finding, value):
+                candidate_hashes[id(finding)] = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).digest()
+                if args.show_secrets:
+                    reveal(finding, value)
+            static_findings = scan(resource.body, resource.url, resource.html, selected & CONTENT_CHECKS, remember)
+            findings.extend(static_findings)
             if analyzer:
-                findings.extend(analyzer.analyze(resource.body, resource.url, resource.html,
-                                                 reveal if args.show_secrets else None))
+                static_credentials = {candidate_hashes[id(f)] for f in static_findings
+                                      if f.category in {"Password", "Access code"} and id(f) in candidate_hashes}
+                for finding in analyzer.analyze(resource.body, resource.url, resource.html, remember):
+                    if finding.category in {"Password", "Local AI"} and candidate_hashes.get(id(finding)) in static_credentials:
+                        ai_duplicate_candidates += 1
+                        visible_values.pop(id(finding), None)
+                    else:
+                        findings.append(finding)
+            inventory_entry["content_candidates"] = sum(f.category != "Coverage" for f in findings[first_content_finding:])
             if resource.response.status_code >= 400:
                 client.issue("HTTP error response audited", resource.url)
             emit("Resource analyzed", resource=safe_url(resource.url), resources_scanned=resources,
@@ -277,13 +302,24 @@ def run_audit(args, selected, progress=None, cancelled=None):
                     "robots_respected": not args.ignore_robots, "max_depth": args.max_depth,
                     "max_pages": args.max_pages, "rate_limit_seconds": args.rate_limit,
                     "search_categories": sorted(selected), "resource_inventory": resource_inventory,
+                    "credential_search": {"requested": bool(selected & {"passwords", "access-codes"}),
+                                          "password_candidates": sum(f.category == "Password" for f in findings),
+                                          "access_candidates": sum(f.category in {"Access code", "Local AI"} for f in findings),
+                                          "source_resources_scanned": resources,
+                                          "javascript_resources_scanned": sum(r["kind"] == "JavaScript" for r in resource_inventory),
+                                          "javascript_executed": False,
+                                          "credentials_validated": False},
                     "hibp_queried": bool(args.hibp_api_key and "breaches" in selected),
                     "max_resource_mb": args.max_resource_mb,
+                    "sitemaps_enabled": getattr(args, "sitemaps", False),
+                    "excluded_domains": list(client.exclusions),
                     "local_ai": {"requested": "local-ai" in selected, "enabled": analyzer is not None,
                                  "chunks_analyzed": analyzer.completed if analyzer else 0,
                                  "chunks_submitted": analyzer.used if analyzer else 0,
                                  "budget_reached": analyzer.skipped if analyzer else False,
                                  "failed": analyzer.failed if analyzer else False,
+                                 "duplicate_candidates_omitted": ai_duplicate_candidates,
+                                 "candidate_pool": "broader_syntax_review" if analyzer else None,
                                  "backend": ("llama.cpp" if args.local_model == "bundled" else "ollama") if analyzer else None,
                                  "context_tokens": analyzer.context_size if analyzer else None,
                                  "budget_unit": "candidate_batches" if analyzer and args.local_model == "bundled" else "source_chunks" if analyzer else None,
@@ -373,10 +409,15 @@ def main(argv: list[str] | None = None) -> int:
         with console.status("Auditing authorized scope…") as status:
             findings, metadata, visible_values = run_audit(
                 args, selected, lambda event: status.update(event["stage"]))
+        assessment = assess_findings(findings, metadata)
+        console.print(assessment["summary"], style="bold yellow", markup=False)
+        console.print(f"Credential candidates: {assessment['credential_candidates']}; header/TLS observations: {assessment['configuration_observations']}.")
         print_summary(findings, console, visible_values if args.show_secrets else None)
         if metadata["resources_scanned"] == 0:
             console.print("No source resources were scanned. This run cannot establish whether passwords or codes are exposed.", style="bold yellow")
         console.print(f"Scanned {metadata['resources_scanned']} resources; {len(findings)} observations. Coverage is bounded.")
+        if "passwords" in selected and not any(f.category == "Password" for f in findings):
+            console.print("No password candidates detected in fetched source. Review the resource inventory and coverage; this is not proof that admin credentials are protected.", style="yellow")
         if args.output:
             export(findings, args.output, args.format, metadata)
             console.print(Text(f"Full report written: {os.path.abspath(args.output)}", style="green"))
@@ -386,10 +427,13 @@ def main(argv: list[str] | None = None) -> int:
                 console.print("Redacted full report copied to the clipboard.", style="green")
             except OSError:
                 console.print("Clipboard unavailable. Install wl-clipboard/xclip on Linux, or use --output.", style="yellow")
-        return 0
+        return 1 if assessment["status"] == "source_scan_failed" else 0
     except KeyboardInterrupt:
         console.print("Audit interrupted; no partial report written.", style="yellow")
         return 130
+    except ExcludedTarget:
+        console.print("Audit blocked: target is on the do-not-test website list. See DO_NOT_TEST.md or gilbrt.scope.DO_NOT_TEST.", style="red")
+        return 1
     except (ValueError, OSError):
         console.print("Audit failed: invalid configuration or report path. Details withheld to protect credentials.", style="red")
         return 1

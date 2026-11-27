@@ -20,7 +20,8 @@ from .cli import AuditCancelled, DEFAULT_CHECKS, SEARCH_OPTIONS, parser, run_aud
 from .crawler import ScopedClient, normalize
 from .local_ai import loopback_url
 from .model_install import MODELS
-from .reporter import render_report
+from .reporter import SEVERITIES, render_report, report_document
+from .scanner import CONTENT_CHECKS, mask
 
 ASSETS = Path(__file__).with_name("gui_assets")
 DEFAULT_SETTINGS = {
@@ -125,6 +126,8 @@ class GUIState:
         self.cancel = threading.Event()
         self.job = None
         self.report = None
+        self.report_id = ""
+        self.revealed_evidence = {}
         self.thread = None
 
     def save_settings(self, data):
@@ -137,28 +140,52 @@ class GUIState:
             self.settings = settings
         return settings
 
-    def snapshot(self):
+    def snapshot(self, known_report=None):
         with self.lock:
-            return copy.deepcopy({"job": self.job, "report": self.report})
+            # Reports are replaced atomically and never mutated after publication.
+            # Copy only the small mutable job; unchanged polls omit the report.
+            result = {"job": copy.deepcopy(self.job), "report_id": self.report_id}
+            if known_report is None or known_report != self.report_id:
+                result["report"] = self.report
+            return result
 
-    def start(self, data):
+    def evidence(self, report_id, index):
+        with self.lock:
+            if not self.report or report_id != self.report_id:
+                raise APIError("This report has changed. Reload the findings.", 409)
+            if not 0 <= index < len(self.report["findings"]):
+                raise APIError("Finding not found.", 404)
+            return {"evidence": self.revealed_evidence.get(index, self.report["findings"][index]["evidence"])}
+
+    def start(self, data, offline=False):
         if not isinstance(data, dict) or data.get("authorized") is not True:
             raise APIError("Confirm that you own the target or have explicit permission to audit it.")
+        files = None
         try:
-            target = normalize(data.get("target", ""))
+            if offline:
+                from .offline import validate_files
+                files = validate_files(data.get("files"))
+                target = "file://local/"
+            else:
+                target = normalize(data.get("target", ""))
         except (ValueError, TypeError, AttributeError):
+            if offline:
+                raise APIError("Choose 1–100 supported text files, up to 16 MiB combined.") from None
             raise APIError("Enter a valid HTTP(S) target without embedded credentials.") from None
         settings = validate_settings(data.get("settings", self.settings))
+        if offline and not set(settings["checks"]) & CONTENT_CHECKS:
+            raise APIError("Select at least one source check for local files.")
         includes = data.get("include_urls", [])
         if not isinstance(includes, list) or len(includes) > 100 or any(not isinstance(x, str) or len(x) > 4096 for x in includes):
             raise APIError("Use at most 100 additional same-origin resource URLs.")
         from urllib.parse import urljoin
-        scope = ScopedClient(target)
-        try:
-            if any(not scope.allowed(urljoin(target, item)) for item in includes):
-                raise APIError("Additional resource URLs must match the target's exact origin.")
-        finally:
-            scope.session.close()
+        if not offline:
+            scope = ScopedClient(target)
+            try:
+                if any(not scope.allowed(urljoin(target, item)) for item in includes):
+                    raise APIError("Additional resource URLs must match the target's exact origin.")
+            finally:
+                scope.session.close()
         with self.lock:
             if self.job and self.job["status"] in {"running", "cancelling"}:
                 raise APIError("An audit is already running. Finish or cancel it first.", 409)
@@ -167,13 +194,14 @@ class GUIState:
                 raise APIError("The selected local model is not installed or reachable. Refresh models in Settings.")
             self.cancel.clear()
             self.job = {"id": secrets.token_hex(8), "status": "running", "target": target,
+                        "mode": "files" if offline else "website",
                         "started_at": time.time(), "elapsed": 0, "events": [], "stage": "Preparing audit",
                         "resources_scanned": 0, "findings": 0}
-            self.thread = threading.Thread(target=self._run, args=(target, settings, includes), daemon=True)
+            self.thread = threading.Thread(target=self._run, args=(target, settings, includes, files), daemon=True)
             self.thread.start()
             return copy.deepcopy(self.job)
 
-    def _run(self, target, settings, includes):
+    def _run(self, target, settings, includes, files=None):
         try:
             args = parser().parse_args([])
             for name, value in settings.items():
@@ -183,6 +211,7 @@ class GUIState:
             args.confirm_authorized = True
             args.local_model = settings["model"] or None
             args.include_url = includes
+            args.show_secrets = True
             selected = set(settings["checks"])
             if args.local_model:
                 selected.add("local-ai")
@@ -194,14 +223,27 @@ class GUIState:
                     self.job["events"].append({**event, "elapsed": self.job["elapsed"]})
                     self.job["events"] = self.job["events"][-60:]
 
-            findings, metadata, _ = run_audit(args, selected, progress, self.cancel.is_set)
+            if files is not None:
+                from .offline import run_local_audit
+                findings, metadata, visible = run_local_audit(args, selected, files, progress, self.cancel.is_set)
+            else:
+                findings, metadata, visible = run_audit(args, selected, progress, self.cancel.is_set)
+            revealed = {}
+            for index, finding in enumerate(sorted(findings, key=lambda f: SEVERITIES[f.severity])):
+                value = visible.get(id(finding))
+                if value is not None:
+                    revealed[index] = finding.evidence.replace(mask(value), value)
             with self.lock:
                 if self.cancel.is_set():
                     raise AuditCancelled()
-                self.report = json.loads(render_report(findings, "json", metadata))
-                self.report["session"] = {"target_origin": f"{urlsplit(target).scheme}://{urlsplit(target).netloc}",
+                self.report = report_document(findings, metadata)
+                self.report["session"] = {"target_origin": "Local files" if files is not None else f"{urlsplit(target).scheme}://{urlsplit(target).netloc}",
                                           "elapsed": round(time.time() - self.job["started_at"], 1)}
+                self.revealed_evidence = revealed
+                self.report_id = self.job["id"]
                 self.job.update(status="complete", stage="Audit complete", elapsed=self.report["session"]["elapsed"])
+                if self.report["assessment"]["status"] == "source_scan_failed":
+                    self.job.update(status="failed", stage="Source scan incomplete", error=self.report["assessment"]["summary"])
         except AuditCancelled:
             with self.lock:
                 self.job.update(status="cancelled", stage="Audit cancelled", elapsed=round(time.time() - self.job["started_at"], 1))
@@ -301,9 +343,18 @@ class GUIHandler(BaseHTTPRequestHandler):
             state = self.server.state
             if path == "/api/bootstrap":
                 return self._send({"token": state.token, "settings": state.settings, "checks": DEFAULT_CHECKS,
+                                   "content_checks": sorted(CONTENT_CHECKS),
                                    "hibp_available": bool(os.environ.get("HIBP_API_KEY")), **state.snapshot()})
             if path == "/api/state":
-                return self._send(state.snapshot())
+                known = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("report_id", [None])[0]
+                return self._send(state.snapshot(known))
+            if path == "/api/evidence":
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    index = int(query.get("index", [""])[0])
+                except ValueError:
+                    raise APIError("Invalid finding index.") from None
+                return self._send(state.evidence(query.get("report_id", [""])[0], index))
             if path == "/api/models":
                 address = parse_qs(urlsplit(self.path).query).get("url", [state.settings["ollama_url"]])[0]
                 try:
@@ -344,8 +395,10 @@ class GUIHandler(BaseHTTPRequestHandler):
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 raise APIError("JSON requests are required.", 415)
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 65536:
-                raise APIError("Request body must be between 1 and 65536 bytes.")
+            path = urlsplit(self.path).path
+            maximum = 32 * 1024 * 1024 if path == "/api/offline" else 65536
+            if not 0 < length <= maximum:
+                raise APIError("Request body exceeds the allowed size.", 413)
             data = json.loads(self.rfile.read(length))
             path = urlsplit(self.path).path
             state = self.server.state
@@ -353,6 +406,8 @@ class GUIHandler(BaseHTTPRequestHandler):
                 return self._send({"settings": state.save_settings(data)})
             if path == "/api/audit":
                 return self._send({"job": state.start(data)}, 202)
+            if path == "/api/offline":
+                return self._send({"job": state.start(data, offline=True)}, 202)
             if path == "/api/cancel":
                 state.cancel_audit()
                 return self._send(state.snapshot())

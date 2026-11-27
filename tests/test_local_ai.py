@@ -200,7 +200,8 @@ class LocalAITests(unittest.TestCase):
             report = json.loads(filename.read_text())
             self.assertEqual(report["metadata"]["local_ai"]["chunks_analyzed"], 1)
             self.assertEqual(report["metadata"]["local_ai"]["chunks_submitted"], 1)
-            self.assertTrue(any(f["category"] == "Local AI" for f in report["findings"]))
+            self.assertEqual(sum(f["category"] in {"Access code", "Local AI"} for f in report["findings"]), 1)
+            self.assertEqual(report["metadata"]["local_ai"]["duplicate_candidates_omitted"], 1)
             self.assertNotIn("fixture-ai-code", filename.read_text())
             self.assertNotIn("fixture-ai-code", terminal.getvalue())
 

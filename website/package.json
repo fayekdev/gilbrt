@@ -3,6 +3,12 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "scripts": { "dev": "node scripts/preview.mjs", "test": "node --test tests/*.test.mjs" },
-  "engines": { "node": ">=22" }
+  "scripts": {
+    "dev": "node scripts/preview.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "build": "node scripts/sync-readme.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
 }

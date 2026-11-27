@@ -3,7 +3,83 @@
 An installable Python 3.10+ CLI for authorized website auditing, static client-side
 secret detection, and opt-in synthetic AI application checks.
 
+Website exclusions are enforced before audit traffic starts. See
+[DO_NOT_TEST.md](DO_NOT_TEST.md) for the built-in blocked websites, scope guidance,
+and additional domain exclusions. Absence from the list does not grant permission.
+
+## Expanded discovery and staging checks
+
+The crawler also discovers same-origin linked stylesheets, quoted CSS imports,
+and embedded frames. Frames consume document depth; stylesheet imports and
+explicit source maps consume the shared resource budget. All discoveries respect
+robots rules, pacing, response-size limits and exact-origin redirect checks.
+
+```bash
+gilbrt --url https://staging.your-domain.example --confirm-authorized --sitemaps --max-pages 100 --max-depth 3 --exclude-domain production.your-domain.example
+```
+
+`--sitemaps` follows sitemap URLs declared in robots.txt, including sitemap indexes.
+Sitemaps and their pages consume the same `--max-pages` budget; no sitemap paths
+are guessed. Sitemap pages are independent depth-zero discovery seeds. When
+`--ignore-robots` is used, robots.txt and its sitemap declarations are not loaded.
+Additional exclusions use repeatable `--exclude-domain DOMAIN` arguments.
+
+Active local/staging configurations can also include `http_checks` alongside
+`isolation` and `prompts` (at most ten configured probes altogether):
+
+```json
+{
+  "environment": "staging",
+  "http_checks": [
+    {"path": "/health", "method": "HEAD", "expected_status": [200],
+     "required_headers": ["X-Content-Type-Options"]},
+    {"path": "/api/public", "method": "OPTIONS", "expected_status": [200, 204]}
+  ]
+}
+```
+
+Run with `--active --active-config staging.json` in addition to the usual URL and
+authorization arguments. Methods are restricted to GET, HEAD and OPTIONS on
+explicit paths; redirects are refused and fresh sessions avoid inherited cookies.
+These checks compare status codes and required header presence. Response bodies
+and header values are withheld from findings. Configure only endpoints whose
+documented behavior is safe for these methods; even GET can cause side effects
+in a poorly designed application. Active checks are CLI-only. CSS/frame discovery
+and the built-in website exclusions also apply to GUI audits.
+
 ## Graphical interface
+
+The GUI matches the website's dark/sage palette and provides Audit, Findings,
+Resources and Settings views. Findings can be filtered by severity and category.
+Matched values are masked until **Show matched value** is selected in a finding;
+exports remain redacted.
+
+### Offline use
+
+After installing gilbrt and its Python dependencies, `gilbrt --gui` works without
+internet. Styles, icons, scripts and system fonts are bundled; there are no CDN,
+analytics, cloud inference or update requests at GUI startup. Keep the local Python
+server running while using the interface.
+
+Choose **New audit → Local files** to inspect HTML, JS/TS, JSON, source maps, CSS or
+TXT files without crawling or making target requests. Select up to 100 text files,
+16 MiB combined; the configured resource count and per-resource size caps also apply.
+Files are processed in memory and are not executed or automatically saved. Report
+resource references use digests rather than original filenames. This mode is
+available in the GUI; website CLI auditing is unchanged.
+
+Static file checks, finding review, settings and report exports work offline.
+Optional model reviews work offline once the bundled model is installed, or when
+an installed local Ollama model and its loopback server are available. Model
+installation, updating, HIBP queries and auditing public websites require internet.
+Headers, TLS and breach checks are disabled for local files. Website audits against
+reachable localhost/LAN targets need only that local network.
+
+In Codespaces, files selected in the browser are sent to your running gilbrt
+instance there. Fully disconnected use requires gilbrt to be installed and running
+on your own machine.
+
+### Launch
 
 Run `gilbrt --gui` (or `python -m gilbrt --gui`) to open the local browser interface.
 From this checkout in PowerShell: `.\.venv\Scripts\python.exe -m gilbrt --gui`.
@@ -24,13 +100,20 @@ access is provided by Codespaces' private forwarding.
 
 The GUI runs the same audit engine as the CLI. Start an authorized audit, select
 checks and an optional installed local model, view live stages and resource counts,
-inspect/filter redacted findings, review coverage, and export JSON, HTML, CSV or AI
+inspect/filter findings, review coverage, and export JSON, HTML, CSV or AI
 Markdown. Discovery has no known total, so progress shows stages and actual counts
 instead of an estimated completion percentage. Coverage percentages describe only
 attempted resources, not the entire site. Cancellation waits for an in-flight
 network or inference request, then stops before the next request; previous completed
-results remain available. Active staging probes and raw secret reveal remain CLI
-features.
+results remain available. Open a finding to see its matched values in the local
+detail view; exported reports remain redacted. Revealed evidence stays in server
+memory for the completed report and is fetched only when a finding is opened.
+Active staging probes remain CLI-only.
+
+Findings and coverage lists show 50 entries per page. Progress polling transfers
+only job updates when the report has not changed, and slows down in background
+tabs. The interface uses circular CSS dials without continuous animations or
+full-screen blur effects.
 
 Open **Settings** to save crawl limits, request pacing, default checks, export
 format, model selection, the loopback Ollama address, AI batch budget, and bundled
@@ -47,6 +130,14 @@ local AI. HIBP catalogue checks use `HIBP_API_KEY` from the launch environment,
 when present; the GUI does not store that key.
 
 ## Local accuracy benchmark
+
+Reports start with a coverage assessment and distinguish credential candidates
+from header/TLS configuration observations. A header-only result does not establish
+that passwords were checked successfully. A run that scans zero source resources
+is marked `source_scan_failed`: the CLI still exports its diagnostics but exits 1,
+and the GUI marks the scan incomplete. Partially inspected sources or interrupted
+AI coverage are labeled partial; a finished bounded crawl is never proof that the
+whole application is secure. No recorded observations are hidden by this summary.
 
 Run a deliberately vulnerable synthetic website bound only to `127.0.0.1`, audit
 it through the real CLI, and compare findings against predefined ground truth:
@@ -84,6 +175,32 @@ credential validity. The extended corpus detected 43/44 intended findings with
 1/29 harmless controls flagged (97.7% precision and recall). AI completed without
 errors or budget exhaustion, but added no case detections on either corpus.
 All 15 header cases and four isolation checks passed after the improvements.
+
+The earlier easy corpus did not establish performance on other websites. A harder
+retest on 2026-11-25 used 27 source cases, including returning/arrow validators,
+embedded hydration data, alternate password names, split provider keys, aliased
+browser input and harmless password instructions:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.benchmark_demo --challenge --with-ai --output-dir .runtime/refinement-after
+.\.venv\Scripts\python.exe -m scripts.benchmark_demo --holdout --with-ai --output-dir .runtime/refinement-holdout
+```
+
+Before refinement, both static checks and bundled AI found 1/14 intended findings,
+with five false alarms among 13 harmless cases. After refinement, static checks
+found 8/14; static plus the actual bundled CPU model found 12/14, with one false
+alarm among the same 13 controls. The four additional detections came from the
+broader AI review pool and remain unconfirmed review candidates. The separate
+20-case variant corpus found 6/10 with static checks and 8/10 with AI, but AI also
+added a false alarm: combined results flagged 2/10 harmless controls. This variant
+set was evaluated after refinement, not used for the before/after comparison.
+These remain small authored fixtures, not an independent real-world benchmark.
+
+Known misses in both harder sets are a secret reconstructed across function
+scopes and a secret available only from an unexecuted runtime fetch. Provider-shaped
+documentation examples can still be flagged, and the tiny model can misclassify
+ordinary UI predicates. JSON results include every miss/false alarm, resource
+coverage, model failures and (for new runs) AI-only case contributions.
 
 These are synthetic development results, not independent certification or an
 estimate of accuracy across arbitrary websites. Provider strings and the private
@@ -152,7 +269,7 @@ invocation requires an interactive terminal; scripts should use explicit flags.
 Passive mode sends GET requests and a verified TLS handshake. It never executes
 JavaScript, submits forms, guesses paths, tests credentials, injects SQL/XSS, or
 validates discovered secrets against providers. Source maps are fetched only when
-explicitly referenced by an already fetched same-origin script. No external
+explicitly referenced by an already fetched same-origin script or stylesheet. No external
 scripts are downloaded. Exact scheme and netloc are enforced at each redirect;
 endpoint inventory only records references already exposed in fetched source and
 does not request guessed or discovered API paths. An HTTP-to-HTTPS redirect
@@ -246,7 +363,7 @@ the CLI `all` selection. It requires an installed local model.
 
 Password checks do not require high entropy: they find literal
 `password`, `passwd`, `pwd`, `pass` and prefixed assignments such as `dbPassword`
-or `DB_PASSWORD`, prefilled password-related HTML fields, and password data
+or `DB_PASSWORD`, including `passwordValue`/`passwordInput` forms, prefilled password-related HTML fields, and password data
 attributes. JavaScript assignments can contain string/numeric literals or supported
 constant expressions. Bounded reconstruction supports string concatenation,
 literal `atob`, `String.fromCharCode`, literal array `.join`, and eligible earlier
@@ -261,6 +378,20 @@ HTML tables with a password-labeled first column are also checked. Source-map
 `sourcesContent` is decoded before scanning, including its escaped source text.
 Empty values, explicit placeholders, environment templates and masked values are
 filtered out. Findings remain candidates; values are never tried against a login service.
+Nested JSON and HTML JSON hydration scripts are parsed explicitly for password
+properties. Visible password fields must be complete fields within a text block;
+unrelated labels, links and help text are not concatenated into a credential.
+Custom dialog callbacks are also checked when the compared value comes from the
+callback's parameter and the dialog call explicitly supplies a `password` input
+type or a recognized access-code label. For example, an unnamed `v.trim()` check
+that sets an admin flag is still a credential candidate. Reports identify this
+as a password-input callback comparison. Array filters, display-template
+conditions and common status values do not enter the broader AI-only pool;
+explicitly named password checks remain eligible even for weak status-like values.
+HTML meta charset declarations are honored when the HTTP header omits a charset,
+so non-ASCII source strings are not silently decoded using the HTTP text default.
+Provider-pattern checks also inspect bounded reconstructed credential assignments,
+so a split or base64-encoded key can match the same provider rules as a raw key.
 
 `connections` detects credential-bearing database, cache, queue and HTTP URLs in
 already fetched content. Connection strings stay masked in reports and are never
@@ -313,10 +444,16 @@ explicit same-origin paths/URLs and obeys robots and the total resource cap. It
 does not generate guessed configuration paths. Use `--max-depth` and `--max-pages`
 to widen coverage. JavaScript is not executed: passwords fetched only at runtime
 from an unlinked API or requiring authentication may remain outside coverage.
+When the resource budget leaves queued references unvisited, the report records
+`Resource budget reached`. Resource inventory entries distinguish JavaScript and
+JSON and count content candidates. `metadata.credential_search` explicitly records
+the credential checks requested, candidates found and source resources inspected;
+no candidates is an inconclusive result, not a clean bill of health.
 
 `--show-secrets` is an explicit exception to terminal redaction: matched values
 appear in full in their terminal table rows, replacing the masked marker.
-Password findings are Critical. Model-reviewed access-code candidates are Warning;
+Password findings are Critical. Model-reviewed named access-code candidates are Warning;
+broader AI-only validator candidates remain Info review observations.
 nearby words such as `password` or `admin` do not promote an unrelated value to a
 Critical password finding. Severity is triage priority, not proof of exploitation.
 Terminal control characters are displayed as escapes. Recording/scrollback may retain values.
@@ -378,6 +515,14 @@ resource are ranked across those scripts by default. Each model batch reviews up
 source excerpts, returning candidate IDs only. Embedded assets and irrelevant
 configuration blocks do not consume the inference budget. This also handles
 minified ternary and short-circuit comparisons that the old text lexer missed.
+The AI review pool also includes syntax-grounded returning validators and
+security-related branches outside the stricter static pool. Each prompt identifies
+the specific candidate value and operator. UI/protocol predicates are filtered
+where recognizable; the model can still misclassify them. Findings already emitted
+by a static credential check are not repeated as additional AI discoveries; metadata
+counts these omitted duplicates. Candidate identifiers prevent invented values
+from entering reports but do not establish the meaning of a literal or immunity
+to source-based prompt injection.
 By default, all retained candidates are reviewed sequentially; there is no two-batch
 stop. This improves larger-site coverage without loading a bigger model or running
 inference in parallel. Longer audits take more time. The spinner reports current

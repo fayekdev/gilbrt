@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 from tree_sitter import Parser
 
-from .js_parser import LANGUAGE, node_literal
+from .js_parser import LANGUAGE, _constant_binding, node_literal
 from .models import Finding
 from .scanner import mask, safe_url
 from .access_codes import credential_literal
@@ -107,7 +107,35 @@ def browser_code(text, url, line_offset=0):
         if node.type in {"member_expression", "subscript_expression"}:
             return bool(re.fullmatch(r"(?:(?:window|document)\s*\.\s*)?location(?:\s*\.\s*(?:hash|search|href|pathname))?|document\s*\.\s*(?:URL|documentURI|referrer)|window\s*\.\s*name", raw(node)))
         if node.type == "identifier":
-            return raw(node) == "location"
+            if raw(node) == "location":
+                return True
+            binding = _constant_binding(node, data)
+            if binding is not None:
+                return browser_input(binding, depth + 1)
+            # Recognize only same-block const destructuring of known location
+            # string properties. Unknown aliases and mutable bindings fail closed.
+            scope = node.parent
+            while scope is not None and scope.type not in {"program", "statement_block"}:
+                scope = scope.parent
+            if scope is not None and scope.end_byte - scope.start_byte <= 128000:
+                for declaration in scope.named_children:
+                    if declaration.end_byte >= node.start_byte or declaration.type != "lexical_declaration" or not re.match(r"const\b", raw(declaration)):
+                        continue
+                    for item in declaration.named_children:
+                        pattern = item.child_by_field_name("name")
+                        if pattern is not None and pattern.type == "object_pattern":
+                            for property_node in pattern.named_children:
+                                if property_node.type == "shorthand_property_identifier_pattern" and raw(property_node) == raw(node) and raw(node) in {"hash", "search", "href", "pathname"}:
+                                    return browser_input(item.child_by_field_name("value"), depth + 1)
+            return False
+        if node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and function.type == "member_expression" and raw(function.child_by_field_name("property")) in {"get", "getAll"}:
+                obj = function.child_by_field_name("object")
+                if obj is not None and obj.type == "new_expression" and raw(obj.child_by_field_name("constructor")) == "URLSearchParams":
+                    args = obj.child_by_field_name("arguments")
+                    return args is not None and any(browser_input(child, depth + 1) for child in args.named_children)
+            return False
         if node.type == "binary_expression":
             operator = node.child_by_field_name("operator")
             return raw(operator) == "+" and any(browser_input(child, depth + 1) for child in node.named_children)

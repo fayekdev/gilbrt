@@ -61,13 +61,46 @@ def print_summary(findings: list[Finding], console: Console, visible_values: dic
         console.print(table)
 
 
-def render_report(findings: list[Finding], fmt: str, metadata: dict) -> str:
-    """Build one sanitized report for file export or an explicit clipboard copy."""
-    data = rows(findings)
-    document = {"tool": "gilbrt", "generated_at": datetime.now(timezone.utc).isoformat(),
-                "metadata": metadata, "findings": data,
+def report_document(findings: list[Finding], metadata: dict) -> dict:
+    """Build sanitized report data without a JSON encode/decode round trip."""
+    return {"tool": "gilbrt", "generated_at": datetime.now(timezone.utc).isoformat(),
+                "metadata": metadata, "findings": rows(findings),
+                "assessment": assess_findings(findings, metadata),
                 "limitations": "Heuristic, bounded audit; absence of findings is not proof of security.",
                 "attribution": "Have I Been Pwned: https://haveibeenpwned.com/ (if queried)"}
+
+
+def assess_findings(findings: list[Finding], metadata: dict) -> dict:
+    """Describe evidence/coverage without treating hardening notes as credentials."""
+    scanned = metadata.get("resources_scanned")
+    coverage = sum(f.category == "Coverage" for f in findings)
+    credentials = sum(f.category in {"Password", "Access code", "Secret", "Connection", "Local AI"} for f in findings)
+    configuration = sum(f.category in {"Headers", "TLS"} for f in findings)
+    ai = metadata.get("local_ai") or {}
+    if scanned == 0:
+        status = "source_scan_failed"
+        summary = "No source inspected. Password and access-code detection could not run. Review coverage errors before retesting."
+    elif scanned is None:
+        status = "unknown"
+        summary = "Source coverage is unknown. Findings alone do not establish whether credential detection ran."
+    else:
+        status = "partial" if coverage or ai.get("failed") or ai.get("budget_reached") else "bounded"
+        requested = metadata.get("search_categories", [])
+        selected = bool(set(requested) & {"passwords", "access-codes", "api-keys", "tokens", "private-keys", "connections", "local-ai"})
+        summary = (f"{credentials} credential candidates in {scanned} scanned resources; credentials were not validated." if credentials else
+                   f"No credential candidates detected in {scanned} scanned resources; this is inconclusive." if selected else
+                   "Credential checks were not selected; review the selected-check coverage.")
+        if status == "partial":
+            summary += " Source or AI coverage is incomplete."
+    return {"status": status, "summary": summary, "credential_candidates": credentials,
+            "configuration_observations": configuration, "coverage_observations": coverage,
+            "other_observations": len(findings) - credentials - configuration - coverage}
+
+
+def render_report(findings: list[Finding], fmt: str, metadata: dict) -> str:
+    """Build one sanitized report for file export or an explicit clipboard copy."""
+    document = report_document(findings, metadata)
+    data = document["findings"]
     if fmt == "json":
         return json.dumps(document, indent=2, ensure_ascii=True)
     elif fmt == "ai":
@@ -76,7 +109,7 @@ def render_report(findings: list[Finding], fmt: str, metadata: dict) -> str:
         serialized = json.dumps({**document, "summary": counts}, indent=2, ensure_ascii=True)
         fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", serialized)), default=3))
         return (
-            "# gilbrt — AI review report\n\n"
+            "# gilbrt — AI review report\n\n" + document["assessment"]["summary"] + "\n\n"
             "## Review task\n\n"
             "Review this authorized security audit. Prioritize findings by severity, distinguish candidates "
             "from confirmed vulnerabilities, explain likely false positives, and propose concrete code/configuration "
@@ -115,6 +148,9 @@ def render_report(findings: list[Finding], fmt: str, metadata: dict) -> str:
             '<style>body{font:15px system-ui;margin:2rem;background:#f7f9fc;color:#172338}'
             'table{border-collapse:collapse;width:100%;background:white}td,th{border:1px solid #cad2df;padding:10px;text-align:left;overflow-wrap:anywhere}'
             'th{background:#dfe9f5}tbody tr:nth-child(even){background:#e8eef7}tbody tr:hover{background:#fff2b3}pre{white-space:pre-wrap}</style></head><body><h1>gilbrt security audit</h1>'
+            f'<p><strong>{html.escape(document["assessment"]["summary"])}</strong></p>'
+            f'<p>{document["assessment"]["credential_candidates"]} credential candidates; '
+            f'{document["assessment"]["configuration_observations"]} header/TLS observations. All observations follow.</p>'
             f'<pre>{html.escape(json.dumps(metadata, indent=2))}</pre><table><thead><tr>{headers}</tr></thead><tbody>{body}</tbody></table>'
             '<p>Heuristic, bounded audit. Absence of findings does not establish security.</p>'
             '<p>Breach data, if queried: <a href="https://haveibeenpwned.com/">Have I Been Pwned</a>.</p></body></html>'

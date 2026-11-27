@@ -7,6 +7,7 @@ or extracting response content. Authorization failures are candidate findings on
 import json
 import os
 import secrets
+import re
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -25,16 +26,27 @@ def load_config(filename: str, client: ScopedClient) -> dict:
         raise ValueError("Active config must declare environment local or staging")
     isolation = config.get("isolation", [])
     prompts = config.get("prompts", [])
-    if not isinstance(isolation, list) or not isinstance(prompts, list) or len(isolation) + len(prompts) > 10:
+    http_checks = config.get("http_checks", [])
+    if any(not isinstance(group, list) for group in (isolation, prompts, http_checks)) or len(isolation) + len(prompts) + len(http_checks) > 10:
         raise ValueError("Active config allows at most 10 explicitly configured probes")
-    if not isolation and not prompts:
+    if not isolation and not prompts and not http_checks:
         raise ValueError("Configure at least one active probe")
-    for probe in isolation + prompts:
+    for probe in isolation + prompts + http_checks:
         if not isinstance(probe, dict) or not isinstance(probe.get("path"), str):
             raise ValueError("Each probe needs an explicit path")
         endpoint = normalize(urljoin(client.target, probe["path"]))
         if not client.allowed(endpoint):
             raise ValueError("Every active endpoint must use the target's exact origin")
+    for probe in http_checks:
+        if not isinstance(probe.get("method", "HEAD"), str) or probe.get("method", "HEAD") not in {"GET", "HEAD", "OPTIONS"}:
+            raise ValueError("HTTP checks support only GET, HEAD and OPTIONS")
+        statuses = probe.get("expected_status", [])
+        headers = probe.get("required_headers", [])
+        if not isinstance(statuses, list) or not statuses or any(type(s) is not int or not 100 <= s <= 599 for s in statuses):
+            raise ValueError("HTTP checks require explicit expected_status codes")
+        if not isinstance(headers, list) or len(headers) > 32 or any(
+                not isinstance(h, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", h) for h in headers):
+            raise ValueError("HTTP required_headers must be a bounded list of header names")
     for probe in isolation:
         if probe.get("synthetic") is not True or not isinstance(probe.get("marker"), str) or len(probe["marker"]) < 16:
             raise ValueError("Isolation probes need synthetic=true and a unique marker of at least 16 characters")
@@ -55,6 +67,19 @@ def load_config(filename: str, client: ScopedClient) -> dict:
 def run_active(client: ScopedClient, config: dict, permitted: Callable[[str], bool]) -> list[Finding]:
     """Run only explicit staging probes; never export their response bodies."""
     findings: list[Finding] = []
+    for probe in config.get("http_checks", []):
+        url = normalize(urljoin(client.target, probe["path"]))
+        method = probe.get("method", "HEAD")
+        response = client.get(url, permitted, {"User-Agent": USER_AGENT}, fresh=True,
+                              follow_redirects=False, method=method)
+        if response is None:
+            continue
+        status_ok = response.status_code in probe["expected_status"]
+        missing = sum(name not in response.headers for name in probe.get("required_headers", []))
+        findings.append(Finding("Info" if status_ok and not missing else "Warning", "HTTP contract",
+                                "HTTP contract satisfied" if status_ok and not missing else "HTTP contract mismatch",
+                                safe_url(url), f"{method}: status {response.status_code}; expected status matched: {status_ok}; missing required headers: {missing}.",
+                                "Review the staging endpoint's status and security header contract; a mismatch alone does not prove exploitability."))
     for probe in config.get("isolation", []):
         url = normalize(urljoin(client.target, probe["path"]))
         marker = probe["marker"]

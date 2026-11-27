@@ -110,6 +110,63 @@ EXTENDED_CASES = [
     Case("dialog-password-form", '<form method="dialog"><input type="password"></form>', None, kind="text/html"),
 ]
 
+# Additional cases fixed before the second refinement run. These intentionally
+# include unsupported behavior and harmless UI text; failures stay in the score.
+CHALLENGE_CASES = [
+    Case("validator-return", 'function verifyInvitation(value){return value === "invite-river-93";}', "Access code"),
+    Case("early-return-auth", 'function checkAccess(v){if(v !== "permit-stone-62") return false; return true;}', "Access code"),
+    Case("minified-return", 'function authenticate(e){return e==="entry-willow-81"}', "Access code"),
+    Case("unfamiliar-access-action", 'if(enteredValue === "entry-maple-28") revealProtectedPanel();', "Access code"),
+    Case("switch-gate", 'switch(accessCode){case "switch-cedar-57":unlock();break;}', "Access code"),
+    Case("password-suffix-name", 'const passwordValue="suffix-elm-46";', "Password"),
+    Case("password-secret-name", 'const loginPasswordHash="not-a-plaintext-password";', None, "A hash-labeled value is not a plaintext credential."),
+    Case("hydration-json", '<script type="application/json">{"credentials":{"password":"hydration-ash-39"}}</script>', "Password", kind="text/html"),
+    Case("encoded-provider-key", 'const apiKey=atob("c2stcHJvai1BYmMxMjNEZWY0NTZHaGk3ODlKa2wwMTI=");', "Secret"),
+    Case("split-provider-key", 'const apiKey="sk-proj-"+"Abc123Def456Ghi789Jkl012";', "Secret"),
+    Case("source-before-sink", 'const query=location.hash; document.getElementById("result").innerHTML=query;', "Browser code"),
+    Case("destructured-source", 'const {hash}=location; result.innerHTML=hash;', "Browser code"),
+    Case("search-params-source", 'const query=new URLSearchParams(location.search).get("q"); result.innerHTML=query;', "Browser code"),
+    Case("runtime-gap", 'fetch("/unlinked-runtime-secret").then(r=>r.json()).then(c=>window.password=c.password);', "Password"),
+    Case("cross-block-secret", 'const prefix="outer-"; function login(){const password=prefix+"beech-45";}', "Password", "Cross-scope reconstruction remains outside bounded folding."),
+    Case("label-help-text", '<label>Password:</label><input type="password"><a>Forgot password?</a>', None, kind="text/html"),
+    Case("password-instructions", '<p>Password: must contain at least eight characters</p>', None, kind="text/html"),
+    Case("password-validation-message", '<div>Password: invalid. Please try again.</div>', None, kind="text/html"),
+    Case("separate-help-blocks", '<div>Password:</div><div>Reset your password here</div>', None, kind="text/html"),
+    Case("ui-return", 'function chooseTheme(v){return v === "midnight";}', None),
+    Case("route-return", 'function isHome(v){return v === "/home";}', None),
+    Case("content-type-return", 'function accepts(v){return v === "application/json";}', None),
+    Case("sanitized-alias", 'const query=DOMPurify.sanitize(location.hash); result.innerHTML=query;', None),
+    Case("overwritten-alias", 'let query=location.hash; query="<b>Safe</b>";result.innerHTML=query;', None),
+    Case("function-boundary-alias", 'const query=location.hash; function display(query){result.innerHTML=query;}', None),
+    Case("commented-source-alias", '// const query=location.hash;\nresult.innerHTML="<b>Safe</b>";', None),
+    Case("provider-documentation", '<pre>Example: sk-proj-DocumentationExampleOnly123456789</pre>', None, "Provider-shaped public examples may remain false alarms.", kind="text/html"),
+]
+
+# A separate variant set used only after the refinement changes, not for the
+# before/after comparison. Keep missed/unsupported cases in its denominator too.
+HOLDOUT_CASES = [
+    Case("account-password-value", 'const accountPasswordValue="holdout-fern-91";', "Password"),
+    Case("prefixed-pwd-value", 'const DB_PWD_VALUE="holdout-spruce-82";', "Password"),
+    Case("password-array-json", '<script type="application/json">{"users":[{"passwordValue":"holdout-birch-73"}]}</script>', "Password", kind="text/html"),
+    Case("concatenated-token", 'const accessToken="ghp_"+"Abc123Def456Ghi789Jkl012";', "Secret"),
+    Case("arrow-validator", 'const validateInvitation = input => input === "holdout-larch-64";', "Access code"),
+    Case("return-validator", 'function validateAdminLogin(s){return s === "holdout-pine-55";}', "Access code"),
+    Case("switch-pin", 'switch(settings.pin){case "holdout-alder-46":unlock();break;}', "Access code"),
+    Case("aliased-search", 'const term=new URLSearchParams(location.search).get("term");document.write(term);', "Browser code"),
+    Case("outer-binding-gap", 'const prefix="holdout-";function enter(){const password=prefix+"fir-37";}', "Password"),
+    Case("runtime-gap", 'fetch("/unlinked-runtime-secret").then(r=>r.json()).then(x=>window.password=x.password);', "Password"),
+    Case("password-helper", '<label>Password:</label><a>Show password</a>', None, kind="text/html"),
+    Case("password-rule", '<p>Password: choose a unique phrase for this account</p>', None, kind="text/html"),
+    Case("password-hash-metadata", 'const config={passwordHash:"a-fake-digest",passwordLength:16};', None),
+    Case("locale-predicate", 'const chooseLocale=v=>v === "en-GB";', None),
+    Case("sidebar-predicate", 'const isSidebarExpanded=v=>v === "expanded";', None),
+    Case("sanitizer-alias", 'const html=DOMPurify.sanitize(location.search);panel.outerHTML=html;', None),
+    Case("mutable-overwrite", 'let html=location.search;html="ready";document.write(html);', None),
+    Case("environment-config", 'const passwordValue=import.meta.env.ADMIN_PASSWORD;', None),
+    Case("quoted-validator", 'const docs="function login(v){return v===\'demo-only\';}";', None),
+    Case("public-key-fixture", 'const key="sk-proj-DocumentationExampleOnly123456789";', None, "Provider-shaped public example remains a potential false alarm."),
+]
+
 HEADER_CASES = {
     "missing-csp": ({"Content-Security-Policy": None}, "Missing Content-Security-Policy"),
     "permissive-csp": ({"Content-Security-Policy": "script-src * 'unsafe-inline'"}, "Permissive script CSP"),
@@ -218,9 +275,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-ai", action="store_true")
     parser.add_argument("--extended", action="store_true", help="Include connection, browser-code and form cases")
+    parser.add_argument("--challenge", action="store_true", help="Use the harder refinement corpus instead of the original cases")
+    parser.add_argument("--holdout", action="store_true", help="Use the separate post-refinement variant corpus")
     parser.add_argument("--output-dir", default=".runtime/demo-benchmark")
     args = parser.parse_args()
-    cases = CASES + EXTENDED_CASES if args.extended else CASES
+    cases = HOLDOUT_CASES if args.holdout else CHALLENGE_CASES if args.challenge else CASES + EXTENDED_CASES if args.extended else CASES
     DemoHandler.cases = cases
     destination = Path(args.output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -267,6 +326,12 @@ def main():
             result["all_case_resources_scanned"] = all(safe_url(origin + "/case/" + c.name) in
                 {r["resource"] for r in result["metadata"]["resource_inventory"]} for c in cases)
             results[mode] = result
+            if mode == "static-plus-ai":
+                baseline = {row["case"]: row["outcome"] for row in results["static"]["cases"]}
+                result["ai_incremental"] = {
+                    "new_true_positive_cases": [row["case"] for row in result["cases"] if row["outcome"] == "TP" and baseline[row["case"]] == "FN"],
+                    "new_false_positive_cases": [row["case"] for row in result["cases"] if row["outcome"] == "FP" and baseline[row["case"]] == "TN"],
+                }
             print(json.dumps({"mode": mode, "counts": result["counts"], "precision": result["precision"],
                               "recall": result["recall"], "elapsed_seconds": result["elapsed_seconds"]}), flush=True)
             (destination / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
