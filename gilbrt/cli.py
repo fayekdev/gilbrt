@@ -97,6 +97,9 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gilbrt", description=__doc__)
     p.add_argument("--gui", action="store_true", help="Open the local graphical audit interface")
     p.add_argument("--gui-port", type=integer, default=4174, help="Local GUI port (default: 4174)")
+    p.add_argument("--gui-report", metavar="FILE", help="Open an existing gilbrt JSON report in the GUI; no new audit")
+    p.add_argument("--no-browser", action="store_true", help="Serve the GUI without launching a browser (headless/SSH use)")
+    p.add_argument("--save-gui", action="store_true", help="Save this redacted CLI result for the GUI, replacing the previous saved CLI result")
     p.add_argument("--url", type=url_argument, help="Exact HTTP(S) origin to audit (prompted in interactive mode)")
     p.add_argument("--confirm-authorized", action="store_true",
                    help="Confirm explicit authorization to audit this system")
@@ -302,16 +305,18 @@ def run_audit(args, selected, progress=None, cancelled=None):
                     "robots_respected": not args.ignore_robots, "max_depth": args.max_depth,
                     "max_pages": args.max_pages, "rate_limit_seconds": args.rate_limit,
                     "search_categories": sorted(selected), "resource_inventory": resource_inventory,
-                    "credential_search": {"requested": bool(selected & {"passwords", "access-codes"}),
+                    "credential_search": {"requested": bool(selected & {"passwords", "access-codes", "api-keys", "tokens", "private-keys", "connections", "local-ai"}),
                                           "password_candidates": sum(f.category == "Password" for f in findings),
-                                          "access_candidates": sum(f.category in {"Access code", "Local AI"} for f in findings),
+                                          "access_candidates": sum(f.category == "Access code" for f in findings),
+                                          "ai_review_candidates": sum(f.category == "Local AI" for f in findings),
                                           "source_resources_scanned": resources,
                                           "javascript_resources_scanned": sum(r["kind"] == "JavaScript" for r in resource_inventory),
                                           "javascript_executed": False,
                                           "credentials_validated": False},
                     "hibp_queried": bool(args.hibp_api_key and "breaches" in selected),
                     "max_resource_mb": args.max_resource_mb,
-                    "sitemaps_enabled": getattr(args, "sitemaps", False),
+                    "sitemaps_requested": getattr(args, "sitemaps", False),
+                    "sitemaps_enabled": getattr(args, "sitemaps", False) and not args.ignore_robots,
                     "excluded_domains": list(client.exclusions),
                     "local_ai": {"requested": "local-ai" in selected, "enabled": analyzer is not None,
                                  "chunks_analyzed": analyzer.completed if analyzer else 0,
@@ -346,9 +351,13 @@ def main(argv: list[str] | None = None) -> int:
     p = parser()
     arguments = sys.argv[1:] if argv is None else argv
     args = p.parse_args(arguments)
-    if args.gui:
+    if args.no_browser and not (args.gui or args.gui_report):
+        p.error("--no-browser requires --gui or --gui-report")
+    if (args.gui or args.gui_report) and args.save_gui:
+        p.error("--save-gui applies to CLI audits; use --gui afterward to view the saved result")
+    if args.gui or args.gui_report:
         from .gui import serve
-        return serve(args.gui_port)
+        return serve(args.gui_port, open_browser=not args.no_browser, report_path=args.gui_report)
     if args.list_models or args.install_models is not None:
         from .model_install import manage_models
         console = Console()
@@ -421,6 +430,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.output:
             export(findings, args.output, args.format, metadata)
             console.print(Text(f"Full report written: {os.path.abspath(args.output)}", style="green"))
+        if args.save_gui:
+            from .report_store import REPORT_NAME, save_report
+            saved = save_report(RUNTIME / REPORT_NAME, findings, metadata)
+            console.print(Text(f"Redacted GUI result saved: {saved.resolve()}", style="green"))
+            console.print("View it with: gilbrt --gui (or reload an idle GUI already running). Raw terminal reveals are not saved.", markup=False)
         if args.copy_report:
             try:
                 copy_to_clipboard(render_report(findings, args.format, metadata))

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import stats from '../api/stats.js';
 import readme from '../api/readme.js';
-import './sync-readme.mjs';
+import './sync-assets.mjs';
 const root = path.resolve(fileURLToPath(new URL('../public/', import.meta.url)));
 const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json', '.sh': 'text/plain', '.md': 'text/markdown' };
 // Match production headers during local browser checks.
@@ -24,7 +24,7 @@ http.createServer(async (req, res) => {
   }
   try {
     const pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
-    const filename = path.resolve(root, '.' + (pathname === '/' ? '/index.html' : pathname === '/install' || pathname === '/install/' ? '/install.html' : pathname));
+    const filename = path.resolve(root, '.' + (pathname === '/' ? '/index.html' : pathname === '/install' || pathname === '/install/' ? '/install.html' : pathname === '/try' || pathname === '/try/' ? '/try.html' : pathname));
     if (!filename.startsWith(root + path.sep) && filename !== path.join(root, 'index.html')) { res.writeHead(403); return res.end(); }
     const body = await readFile(filename);
     res.setHeader('Content-Type', `${types[path.extname(filename)] || 'application/octet-stream'}; charset=utf-8`);

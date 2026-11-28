@@ -141,6 +141,37 @@ footer p a { color: #bec9bc; }
 .skip { position: absolute; top: -100px; left: 20px; background: var(--accent); color: var(--bg); padding: 10px; z-index: 10; }
 .skip:focus { top: 10px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* Browser-only product demo; matches the local application's report layout. */
+.try-main { padding-block: 55px 85px; }
+.try-heading { display: flex; align-items: end; justify-content: space-between; gap: 25px; margin-bottom: 30px; }
+.try-heading h1 { font-size: 62px; letter-spacing: -3px; margin-block: 18px; }
+.try-heading>div>p:last-child { font-size: 17px; }
+.try-heading>.text-link { margin-bottom: 4px; }
+.try-notice { display: flex; align-items: center; gap: 14px; border: 1px solid #35432e; background: #151e11; border-radius: 5px; padding: 13px 17px; }
+.try-notice>span { font: 10px var(--mono); letter-spacing: 1px; color: #bed6a9; }
+.try-notice p { font-size: 13px; color: #a9bb9d; }
+.try-target-form { display: flex; gap: 16px; align-items: end; margin: 27px 0 25px; }
+.try-target-form>div { flex: 1; min-width: 0; }
+.try-target-form label { display: block; font-size: 12px; margin-bottom: 8px; color: #a9b7a1; }
+.try-target-form input { width: 100%; background: #10170e; color: #d2e1c7; border: 1px solid #3d4e32; border-radius: 4px; padding: 11px 14px; font: 14px/1.7 var(--mono); }
+.try-target-form .button { min-height: 48px; }
+.try-page input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.try-page button:disabled, .try-page input:disabled { opacity: .55; cursor: wait; }
+.try-view-tabs { display: flex; gap: 24px; border-bottom: 1px solid #34412c; margin-bottom: 20px; }
+.try-view-tabs button { padding: 12px 3px; background: none; border: 0; border-bottom: 2px solid transparent; color: #8e9f83; font-size: 14px; }
+.try-view-tabs button[aria-selected='true'] { color: #d8e7ce; border-bottom-color: #b9d0a5; }
+.try-gui { display: block; border: 1px solid #303c29; border-radius: 7px; overflow: hidden; background: #0b0d0c; }
+.try-cli { border: 1px solid #35472c; border-radius: 7px; background: #0b1308; overflow: hidden; }
+.try-terminal-bar { display: flex; justify-content: space-between; gap: 20px; padding: 16px 22px; border-bottom: 1px solid #2f4027; font: 10px var(--mono); color: #9bb487; }
+.try-terminal-bar>span:last-child { color: #7e9a69; letter-spacing: .6px; }
+#demo-terminal-output { margin: 0; padding: 25px; height: 440px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/2 var(--mono); color: #bcd6a7; scrollbar-width: thin; scrollbar-color: #415a31 transparent; }
+.try-command-form { display: flex; align-items: center; gap: 13px; padding: 15px 22px; border-block: 1px solid #2d4123; background: #111e0b; }
+.try-command-form label { color: #b9d9a1; font: 16px var(--mono); }
+.try-command-form input { min-width: 0; flex: 1; width: 100%; color: #d0e7bc; background: transparent; border: 0; padding: 8px 3px; font: 12px/1.6 var(--mono); }
+.try-command-form .button { padding: 7px 18px; font-size: 12px; }
+.try-terminal-hints { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 17px 22px 0; font-size: 11px; color: #829b71; }
+.try-terminal-hints button { background: #1c2b15; border: 1px solid #344c28; border-radius: 3px; color: #b5cea2; font: 10px var(--mono); padding: 5px 8px; }
+.try-terminal-note { font-size: 11px; line-height: 1.8; color: #8fa77e; padding: 17px 22px 20px; }
 @media (min-width: 1500px) { .hero { min-height: 720px; } }
 @media (max-width: 1050px) {
   .wrap { width: calc(100% - 64px); }
@@ -154,7 +185,10 @@ footer p a { color: #bec9bc; }
 }
 @media (max-width: 700px) {
   .wrap { width: calc(100% - 40px); }
-  .nav { height: 76px; gap: 15px; }
+  .nav { height: auto; min-height: 108px; flex-wrap: wrap; gap: 0 15px; padding-block: 16px 12px; }
+  .nav>.brand { order: 0; }
+  .nav>.repo-stars { order: 1; margin-left: auto; }
+  .nav nav { order: 2; flex-basis: 100%; margin-left: 0; justify-content: space-between; padding-top: 16px; }
   .brand { font-size: 25px; }
   .nav nav { gap: 13px; font-size: 12px; }
   .repo-stars { padding: 4px 8px; gap: 7px; font-size: 11px; }
@@ -202,6 +236,25 @@ footer p a { color: #bec9bc; }
   footer { flex-wrap: wrap; gap: 16px; padding-block: 24px; }
   footer p { order: 3; width: 100%; font-size: 11px; }
   footer nav { font-size: 11px; gap: 20px; }
+}
+@media (max-width: 700px) {
+  .try-main { padding-block: 36px 55px; }
+  .try-heading { align-items: start; flex-direction: column; gap: 18px; }
+  .try-heading h1 { font-size: 49px; letter-spacing: -2px; }
+  .try-heading>div>p:last-child { font-size: 15px; }
+  .try-notice { align-items: start; padding: 13px; }
+  .try-notice>span { padding-top: 4px; }
+  .try-notice p { font-size: 12px; }
+  .try-target-form { align-items: stretch; flex-direction: column; gap: 12px; }
+  .try-target-form input { font-size: 13px; }
+  .try-target-form .button { align-self: flex-start; font-size: 13px; min-height: 42px; }
+  .try-terminal-bar { padding-inline: 15px; font-size: 9px; }
+  .try-terminal-bar>span:last-child { display: none; }
+  #demo-terminal-output { height: 380px; padding: 18px; font-size: 11px; }
+  .try-command-form { flex-wrap: wrap; padding: 13px 15px; gap: 10px; }
+  .try-command-form input { font-size: 11px; }
+  .try-command-form .button { margin-left: auto; }
+  .try-terminal-hints, .try-terminal-note { padding-inline: 15px; }
 }
 @media (max-width: 360px) {
   .nav { gap: 10px; }

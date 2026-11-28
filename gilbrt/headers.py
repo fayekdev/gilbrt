@@ -1,6 +1,7 @@
 """Heuristic browser-defense checks and verified TLS certificate inspection."""
 
 import re
+import ipaddress
 import socket
 import ssl
 from datetime import datetime, timezone
@@ -31,7 +32,15 @@ def analyze_headers(response: requests.Response, document: bool = True) -> list[
         "Permissions-Policy": "Restrict browser features to the origins that require them.",
     }
     csp = headers.get("Content-Security-Policy", "") if document else ""
+    parsed = urlsplit(response.url)
+    try:
+        ipaddress.ip_address(parsed.hostname or "")
+        hsts_host = False
+    except ValueError:
+        hsts_host = True
     for name, advice in (checks.items() if document else ()):
+        if name == "Strict-Transport-Security" and (parsed.scheme != "https" or not hsts_host):
+            continue  # HSTS is learned only over HTTPS and does not apply to IP hosts.
         if not headers.get(name, "").strip():
             if name == "X-Frame-Options" and re.search(r"(?:^|;)\s*frame-ancestors\s+", csp, re.I):
                 continue
@@ -50,7 +59,9 @@ def analyze_headers(response: requests.Response, document: bool = True) -> list[
             add("CSP does not restrict scripts", "No script-src or default-src directive.", checks["Content-Security-Policy"])
     hsts = headers.get("Strict-Transport-Security", "") if document else ""
     age = re.search(r"(?:^|;)\s*max-age\s*=\s*(\d+)\s*(?:;|$)", hsts, re.I)
-    if hsts and (not age or int(age.group(1)) < 15552000):
+    digits = age.group(1).lstrip("0") or "0" if age else ""
+    short_age = len(digits) < 8 or len(digits) == 8 and digits < "15552000"
+    if hsts and parsed.scheme == "https" and hsts_host and (not age or short_age):
         add("Weak HSTS policy", "Missing, invalid or short max-age (<180 days).", checks["Strict-Transport-Security"])
     if hsts and urlsplit(response.url).scheme != "https":
         add("HSTS sent over HTTP", "Browsers do not accept HSTS from insecure HTTP.", checks["Strict-Transport-Security"])

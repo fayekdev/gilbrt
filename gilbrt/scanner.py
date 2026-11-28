@@ -295,15 +295,18 @@ def scan(text: str, url: str, html: bool = False, checks: set[str] | None = None
                 ))
                 if on_secret:
                     on_secret(findings[-1], value)
-    for match in ASSIGNMENT.finditer(text):
-        if "entropy" not in enabled:
-            break
-        value = match.group(1)
+    entropy_sources = []
+    if "entropy" in enabled:
+        from .js_parser import secret_literals
+        sources = [(m.group(1), m.start(1)) for m in re.finditer(r"<script\b[^>]*>([\s\S]*?)</script\s*>", text, re.I)] if html else [(text, 0)]
+        entropy_sources = [(value, text.count("\n", 0, base + offset) + 1)
+                           for source, base in sources for value, offset in secret_literals(source)]
+    for value, line in entropy_sources:
         if (credential_literal(value) and not re.match(r"https?://|/", value) and len(value) >= 20
                 and entropy(value) >= 3.5 and not any(v == value and kind != "access code" for kind, v in seen)):
             seen.add(("entropy", value))
             findings.append(Finding("Warning", "Secret", "High-entropy sensitive assignment", location,
-                                    f"Line {text.count(chr(10), 0, match.start()) + 1}; {mask(value)}",
+                                    f"Line {line}; {mask(value)}; parsed sensitive assignment, not validated",
                                     "Review this candidate; use a server-side secret store if confidential."))
             if on_secret:
                 on_secret(findings[-1], value)

@@ -8,6 +8,23 @@ const PAGE_SIZE = 40;
 let token = '', settings = null, checks = [], sourceChecks = [], models = [{id:'',name:'Static checks only'}];
 let report = null, reportId = '', job = null, mode = 'website', connected = false, booting = false;
 let pollTimer, toastTimer, lastTerminal = '', findingPage = 0, resourcePage = 0, detailIndex = -1, evidenceRequest = 0;
+let scanClockTimer = null, scanClockSample = null;
+let startingAudit = false;
+const GUI_PROTOCOL = 2;
+
+function paintScanClock() {
+  $('#scan-elapsed').textContent = GilbrtAuditClock.format(GilbrtAuditClock.seconds(scanClockSample, performance.now()));
+}
+function syncScanClock() {
+  if (!globalThis.GilbrtAuditClock) { $('#scan-elapsed').textContent = 'Restart GUI'; return; }
+  scanClockSample = GilbrtAuditClock.sample(job, scanClockSample, performance.now());
+  paintScanClock();
+  if (scanClockSample?.active) {
+    if (scanClockTimer === null) scanClockTimer = setInterval(paintScanClock, 1000);
+  } else {
+    clearInterval(scanClockTimer); scanClockTimer = null;
+  }
+}
 
 async function api(path, body) {
   let response;
@@ -22,7 +39,7 @@ async function api(path, body) {
     throw Error('Engine unavailable. Start gilbrt --gui, then reconnect.');
   }
   const data = await response.json();
-  if (!response.ok) throw Error(data.error || 'Request failed.');
+  if (!response.ok) throw Error(data.error === 'Unknown settings or invalid settings object.' ? 'Restart gilbrt --gui, then refresh this page. The running server does not support these audit options.' : data.error || 'Request failed.');
   return data;
 }
 function notify(message) {
@@ -92,7 +109,14 @@ function render() {
   $('#empty-state').hidden = !!report; $('#audit-results').hidden = !report;
   $('#export-top').disabled = !report || !connected;
   $('#nav-count').textContent = findings().length; $('#nav-count').hidden = !findings().length;
-  for (const severity of ['Critical','Warning','Info']) $(`#${severity.toLowerCase()}-count`).textContent = findings().filter(finding => finding.severity === severity).length;
+  const severityTotal = findings().filter(finding => ['Critical','Warning','Info'].includes(finding.severity)).length;
+  for (const severity of ['Critical','Warning','Info']) {
+    const count = findings().filter(finding => finding.severity === severity).length;
+    $(`#${severity.toLowerCase()}-count`).textContent = count;
+    $(`#${severity.toLowerCase()}-arc`).style.strokeDasharray = `${severityTotal ? count / severityTotal * 100 : 0} 100`;
+    $(`[data-severity="${severity}"]`).setAttribute('aria-label',`${severity}: ${count} ${count === 1 ? 'finding' : 'findings'}. Filter findings.`);
+    $(`#${severity.toLowerCase()}-arc`).closest('.severity-dial').title = `${severityTotal ? Math.round(count / severityTotal * 100) : 0}% of reported findings`;
+  }
   if (report) {
     const meta = report.metadata, local = meta.mode === 'files', assessment = report.assessment || {};
     $('#target-name').textContent = report.session?.target_origin || meta.target;
@@ -121,10 +145,42 @@ function acceptReport(data) {
   report?.findings.forEach((finding,index) => finding.index = index);
 }
 function renderChecks(selector, selected) {
-  $(selector).innerHTML = checks.map(check => {
+  const groups = [
+    ['Source exposure',['passwords','access-codes','api-keys','tokens','private-keys','connections','browser-code','forms']],
+    ['Review signals',['entropy','comments','endpoints']],
+    ['Website configuration',['headers','tls','breaches']]
+  ];
+  const checkbox = check => {
     const disabled = selector === '#audit-checks' && mode === 'files' && !sourceChecks.includes(check);
     return `<label class="${disabled ? 'disabled' : ''}"><input type="checkbox" value="${escapeHTML(check)}" ${selected.includes(check) && !disabled ? 'checked' : ''} ${disabled ? 'disabled' : ''}><span>${escapeHTML(checkNames[check] || check)}</span></label>`;
+  };
+  $(selector).innerHTML = groups.map(([name,items]) => {
+    const available = items.filter(check => checks.includes(check) && (selector !== '#audit-checks' || mode !== 'files' || sourceChecks.includes(check)));
+    return available.length ? `<div class="check-group"><h3>${name}</h3><div class="check-options">${available.map(checkbox).join('')}</div></div>` : '';
   }).join('');
+  updateCheckSummary();
+}
+function updateCheckSummary() {
+  $('#selected-checks').textContent = `${all('#audit-checks input:checked').length} selected`;
+  const inputs = all('#audit-checks input:not(:disabled)');
+  $('#toggle-checks').textContent = inputs.length && inputs.every(input => input.checked) ? 'Clear all' : 'Select all';
+}
+function updateConfirmation() {
+  const value = Number($('#authorization').value), ready = value === 100;
+  $('#confirm-track').style.setProperty('--confirmation',`${value}%`);
+  $('#confirm-track').style.setProperty('--confirm-hue',String(value * 1.2));
+  $('#confirm-track').classList.toggle('ready',ready);
+  $('#authorization').setAttribute('aria-valuetext',ready ? 'Authorized. Click the green pill to start audit.' : `${value}% — slide fully to authorize`);
+  $('#confirmation-status').textContent = ready ? 'Ready. Click the green pill to start the audit.' : 'Slide fully, then click the filled pill to start.';
+  $('#authorization').hidden = ready;
+  $('#confirmation-fill-label').hidden = ready;
+  $('#start-audit').hidden = !ready;
+  $('#start-audit').textContent = startingAudit ? 'Starting audit…' : 'Click to start audit';
+  $('#start-audit').disabled = !ready || startingAudit;
+  $('#authorization').disabled = startingAudit;
+}
+function resetConfirmation() {
+  $('#authorization').value = '0'; updateConfirmation();
 }
 function setModels(selector,value) {
   const list = [...models];
@@ -135,7 +191,7 @@ function setModels(selector,value) {
 function fillSettings() {
   for (const [name,value] of Object.entries(settings)) {
     const field = $('#settings-form').elements.namedItem(name); if (!field) continue;
-    if (field.type === 'checkbox') field.checked = value; else field.value = value ?? '';
+    if (field.type === 'checkbox') field.checked = value; else field.value = Array.isArray(value) ? value.join('\n') : value ?? '';
   }
   renderChecks('#settings-checks',settings.checks); setModels('#settings-model',settings.model);
 }
@@ -153,12 +209,22 @@ async function refreshModels() {
 }
 function readSettings() {
   const form = $('#settings-form'), result = {...settings};
-  for (const key of ['max_pages','max_depth','max_resource_mb','rate_limit','ai_candidate_limit']) result[key] = Number(form.elements.namedItem(key).value);
-  result.ai_max_chunks = form.elements.namedItem('ai_max_chunks').value === '' ? null : Number(form.elements.namedItem('ai_max_chunks').value);
+  Object.assign(result, readAuditOptions(form));
+  result.exclude_domain = form.elements.namedItem('exclude_domain').value.split('\n').map(line => line.trim()).filter(Boolean);
   for (const key of ['model','ollama_url','export_format']) result[key] = form.elements.namedItem(key).value;
-  result.ignore_robots = form.elements.namedItem('ignore_robots').checked;
   result.checks = all('#settings-checks input:checked').map(input => input.value);
   return result;
+}
+function readAuditOptions(form) {
+  const result = {};
+  for (const key of ['max_pages','max_depth','max_resource_mb','rate_limit','ai_candidate_limit']) result[key] = Number(form.elements.namedItem(key).value);
+  result.ai_max_chunks = form.elements.namedItem('ai_max_chunks').value === '' ? null : Number(form.elements.namedItem('ai_max_chunks').value);
+  for (const key of ['ignore_robots','sitemaps']) result[key] = form.elements.namedItem(key).checked;
+  return result;
+}
+function updateAuditSummary() {
+  const options = readAuditOptions($('#setup-form'));
+  $('#audit-config-summary').textContent = mode === 'files' ? `${options.max_pages} file limit · ${options.max_resource_mb} MiB per file · no website requests` : `${options.max_pages} resources · depth ${options.max_depth} · ${options.rate_limit}s delay · sitemaps ${options.sitemaps && !options.ignore_robots ? 'on' : 'off'}`;
 }
 async function saveSettings(event) {
   event.preventDefault(); const button = $('#settings-form button[type=submit]'); button.disabled = true;
@@ -175,24 +241,38 @@ function selectMode(value) {
   $('#target').required = mode === 'website'; $('#target').disabled = mode !== 'website';
   $('#source-files').required = mode === 'files'; $('#source-files').disabled = mode !== 'files';
   $('#extra-resources').hidden = mode === 'files';
+  $('#audit-website-options').hidden = mode === 'files';
+  $('#audit-website-options').disabled = mode === 'files';
   $('#authorization-label').textContent = mode === 'files' ? 'I own these files or have permission to inspect them.' : 'I own this website or have permission to audit it.';
   renderChecks('#audit-checks',selected.length ? selected : settings.checks);
-  $('#audit-config-summary').textContent = mode === 'files' ? `${settings.max_pages} file limit · ${settings.max_resource_mb} MiB per file · no website requests` : `${settings.max_pages} resources · depth ${settings.max_depth} · ${settings.rate_limit}s delay`;
+  resetConfirmation();
+  updateAuditSummary();
 }
 function openSetup() {
   if (!connected) return notify('Start gilbrt --gui, then reconnect.');
   if (job && ['running','cancelling'].includes(job.status)) { updateScan(); $('#scan-dialog').showModal(); return; }
+  for (const [name,value] of Object.entries(settings)) {
+    const field = $('#setup-form').elements.namedItem(name); if (!field) continue;
+    if (field.type === 'checkbox') field.checked = value; else field.value = Array.isArray(value) ? value.join('\n') : value ?? '';
+  }
   renderChecks('#audit-checks',settings.checks); selectMode(mode); setModels('#audit-model',settings.model);
-  $('#form-error').textContent = ''; $('#authorization').checked = false;
+  $('#form-error').textContent = ''; resetConfirmation();
   $('#setup-dialog').showModal();
 }
 async function startAudit(event) {
-  event.preventDefault(); const button = $('#start-audit'); button.disabled = true; $('#form-error').textContent = '';
+  event.preventDefault();
+  if (startingAudit) return;
+  $('#form-error').textContent = '';
+  if (Number($('#authorization').value) !== 100) {
+    $('#form-error').textContent = 'Slide fully to authorize, then click confirm.';
+    return;
+  }
+  startingAudit = true; updateConfirmation();
   const selectedMode = mode;
   try {
-    const options = {...settings,model:$('#audit-model').value,checks:all('#audit-checks input:checked').map(input => input.value)};
+    const options = {...settings,...readAuditOptions($('#setup-form')),model:$('#audit-model').value,checks:all('#audit-checks input:checked').map(input => input.value)};
     if (!options.checks.length) throw Error('Select at least one check.');
-    const data = {authorized:$('#authorization').checked,settings:options};
+    const data = {authorized:true,settings:options};
     if (selectedMode === 'files') {
       const files = [...$('#source-files').files];
       if (!files.length || files.length > 100) throw Error('Choose 1–100 source files.');
@@ -206,10 +286,11 @@ async function startAudit(event) {
     const response = await api(selectedMode === 'files' ? '/api/offline' : '/api/audit',data);
     job = response.job; $('#setup-dialog').close(); updateScan(); $('#scan-dialog').showModal(); schedulePoll(300);
   } catch (error) { $('#form-error').textContent = error.message; }
-  finally { button.disabled = false; }
+  finally { startingAudit = false; resetConfirmation(); }
 }
 function updateScan() {
   if (!job) return;
+  syncScanClock();
   $('#scan-target').textContent = job.mode === 'files' ? 'Local source files' : (() => {try { return new URL(job.target).origin; } catch { return 'Website'; }})();
   $('#scan-stage').textContent = job.stage;
   $('#scan-count').textContent = `${job.resources_scanned} scanned`;
@@ -222,6 +303,7 @@ async function poll() {
     const data = await api(`/api/state?report_id=${encodeURIComponent(reportId)}`);
     connection(true); job = data.job; acceptReport(data);
     if (job && ['running','cancelling'].includes(job.status)) { updateScan(); renderActivity(); schedulePoll(); return; }
+    syncScanClock();
     if ($('#scan-dialog').open) $('#scan-dialog').close();
     const terminal = job ? `${job.id}:${job.status}` : '';
     if (terminal && terminal !== lastTerminal) {
@@ -244,7 +326,7 @@ function showFinding(index) {
   $('#detail-title').textContent = finding.title; $('#detail-category').textContent = finding.category;
   $('#detail-evidence').textContent = finding.evidence; $('#detail-resource').textContent = finding.url;
   $('#detail-remediation').textContent = finding.remediation;
-  $('#reveal-evidence').hidden = !['Password','Access code','Secret','Connection','Local AI'].includes(finding.category);
+  $('#reveal-evidence').hidden = report?.session?.source === 'saved CLI report' || !['Password','Access code','Secret','Connection','Local AI'].includes(finding.category);
   $('#reveal-evidence').disabled = false;
   $('#reveal-evidence').innerHTML = `${icon('eye')}Show matched value`;
   $('#finding-dialog').showModal();
@@ -269,14 +351,32 @@ async function downloadReport() {
     setTimeout(() => URL.revokeObjectURL(url),1000); $('#export-dialog').close(); notify('Report exported.');
   } catch (error) { notify(error.message); } finally { button.disabled = false; }
 }
+async function copyReport() {
+  const button = $('#copy-report'); button.disabled = true;
+  $('#export-error').textContent = '';
+  $('#export-status').textContent = '';
+  try {
+    if (!navigator.clipboard?.writeText) throw Error('Clipboard access is unavailable in this browser. Use Download instead.');
+    const format = $('#export-format').value;
+    const response = await fetch(`/api/export?format=${encodeURIComponent(format)}`,{headers:{'X-Gilbrt-Token':token},signal:AbortSignal.timeout(15000)});
+    if (!response.ok) throw Error((await response.json()).error || 'Export failed.');
+    // Always use the server's redacted export, including after locally revealing evidence.
+    const text = await response.text();
+    await navigator.clipboard.writeText(text);
+    $('#export-status').textContent = 'Redacted report copied to clipboard.';
+  } catch (error) {
+    $('#export-error').textContent = error.name === 'NotAllowedError' ? 'Clipboard permission was denied. Allow clipboard access or use Download.' : error.message;
+  } finally { button.disabled = false; }
+}
 async function initialize() {
   if (booting) return; booting = true; clearTimeout(pollTimer);
   try {
     const response = await fetch('/api/bootstrap',{signal:AbortSignal.timeout(10000)});
     const data = await response.json(); if (!response.ok) throw Error(data.error || 'Engine unavailable.');
+    if (data.gui_protocol !== GUI_PROTOCOL) throw Error('The running GUI server uses an older interface. Stop it with Ctrl+C, run gilbrt --gui again, then refresh this page.');
     token = data.token; settings = data.settings; checks = data.checks;
     sourceChecks = data.content_checks || checks.filter(check => !['headers','tls','breaches'].includes(check));
-    job = data.job; acceptReport(data); connection(true); fillSettings(); render();
+    job = data.job; acceptReport(data); syncScanClock(); connection(true); fillSettings(); render();
     $('#hibp-status').textContent = data.hibp_available ? 'Breach catalogue uses HIBP and requires internet.' : 'Breach catalogue requires internet and HIBP_API_KEY.';
     refreshModels();
     if (job && ['running','cancelling'].includes(job.status)) { updateScan(); if (!$('#scan-dialog').open) $('#scan-dialog').showModal(); schedulePoll(); }
@@ -303,8 +403,11 @@ $('#cancel-scan').addEventListener('click',cancelAudit);
 $('#scan-dialog').addEventListener('cancel',event => { event.preventDefault(); cancelAudit(); });
 $('#reveal-evidence').addEventListener('click',revealEvidence);
 $('#finding-dialog').addEventListener('close',() => { evidenceRequest++; detailIndex = -1; $('#detail-evidence').textContent = ''; });
-$('#export-top').addEventListener('click',() => { $('#export-format').value = settings.export_format; $('#export-dialog').showModal(); });
+$('#export-top').addEventListener('click',() => { $('#export-format').value = settings.export_format; $('#export-error').textContent = ''; $('#export-status').textContent = ''; $('#export-dialog').showModal(); });
+$('#export-format').addEventListener('change',() => { $('#export-error').textContent = ''; $('#export-status').textContent = ''; });
 $('#download-report').addEventListener('click',downloadReport);
+$('#copy-report').addEventListener('click',copyReport);
+$('#authorization').addEventListener('change',() => { if (Number($('#authorization').value) === 100) $('#start-audit').focus(); });
 for (const id of ['search','severity','category']) $(`#${id}`).addEventListener(id === 'search' ? 'input' : 'change',() => { findingPage = 0; renderFindings(); });
 $('#clear-filters').addEventListener('click',() => { $('#search').value = ''; $('#severity').value = 'all'; $('#category').value = 'all'; findingPage = 0; renderFindings(); });
 for (const [prefix,renderPage] of [['finding',renderFindings],['resource',renderResources]]) {
@@ -312,11 +415,18 @@ for (const [prefix,renderPage] of [['finding',renderFindings],['resource',render
     if (prefix === 'finding') findingPage = Math.max(0,findingPage+delta); else resourcePage = Math.max(0,resourcePage+delta); renderPage();
   });
 }
-$('#toggle-checks').addEventListener('click',() => { const inputs = all('#audit-checks input:not(:disabled)'), select = inputs.some(input => !input.checked); inputs.forEach(input => input.checked = select); $('#toggle-checks').textContent = select ? 'Clear all' : 'Select all'; });
+$('#toggle-checks').addEventListener('click',() => { const inputs = all('#audit-checks input:not(:disabled)'), select = inputs.some(input => !input.checked); inputs.forEach(input => input.checked = select); $('#toggle-checks').textContent = select ? 'Clear all' : 'Select all'; updateCheckSummary(); resetConfirmation(); });
 $('#source-files').addEventListener('change',() => { const files = [...$('#source-files').files]; $('#file-summary').textContent = files.length ? `${files.length} files · ${(files.reduce((total,file) => total+file.size,0)/1024).toFixed(1)} KiB` : 'Up to 100 files · 16 MiB combined.'; });
 $('#reset-settings').addEventListener('click',() => {
   const form = $('#settings-form');
   for (const [name,value] of Object.entries({max_pages:25,max_depth:2,max_resource_mb:16,rate_limit:1,ollama_url:'http://127.0.0.1:11434',ai_max_chunks:'',ai_candidate_limit:256,export_format:'json',model:''})) form.elements.namedItem(name).value = value;
-  form.elements.namedItem('ignore_robots').checked = false; renderChecks('#settings-checks',checks); notify('Defaults restored. Save to apply.');
+  for (const key of ['ignore_robots','sitemaps']) form.elements.namedItem(key).checked = false;
+  form.elements.namedItem('exclude_domain').value = '';
+  renderChecks('#settings-checks',checks); notify('Defaults restored. Save to apply.');
+});
+$('#audit-options').addEventListener('input',updateAuditSummary);
+$('#setup-form').addEventListener('input',event => {
+  if (event.target === $('#authorization')) updateConfirmation(); else resetConfirmation();
+  updateCheckSummary();
 });
 render(); navigate(location.hash.slice(1)); initialize();

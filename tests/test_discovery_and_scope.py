@@ -79,6 +79,11 @@ class DiscoveryScopeTests(unittest.TestCase):
         self.client = ScopedClient(self.url, delay=0)
         self.addCleanup(self.client.session.close)
 
+    def test_redirect_to_previously_scanned_resource_is_not_analyzed_twice(self):
+        resources=list(Crawler(self.client,max_pages=3,include_urls=["/hidden","/redirect"]).crawl())
+        self.assertEqual(sum(r.url==self.url+"/hidden" for r in resources),1)
+        self.assertEqual(len(resources),2)
+
     def config(self, config):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "active.json"

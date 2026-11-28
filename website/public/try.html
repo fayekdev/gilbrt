@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d0c">
+  <meta name="description" content="Explore a sample gilbrt audit report in the browser or terminal demo.">
+  <meta property="og:title" content="Try gilbrt">
+  <meta property="og:description" content="Check public source, security headers, and TLS from your terminal.">
+  <title>Try gilbrt — GUI &amp; CLI demo</title>
+  <link rel="icon" href="/favicon.ico?v=2" sizes="any">
+  <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+  <script type="module" src="/try-demo.js"></script>
+</head>
+<body class="try-page">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="nav wrap">
+    <a class="brand" href="/" aria-label="gilbrt home">gilbrt<span>.</span></a>
+    <nav aria-label="Main navigation"><a href="/#docs">Docs</a><a href="/try" aria-current="page">Try me out</a><a href="/#workflows">Workflows</a><a href="/install">Install</a></nav>
+    <a class="repo-stars" href="https://github.com/fayekdev/gilbrt" aria-label="Star gilbrt on GitHub"><span aria-hidden="true">☆</span><span class="star-label">GitHub</span><span id="repo-stars" aria-hidden="true">—</span></a>
+  </header>
+  <main id="main" class="wrap try-main">
+    <div class="try-heading"><div><p class="eyebrow">INTERACTIVE DEMO</p><h1>Try gilbrt.</h1><p>Explore the report. Or use the terminal.</p></div><a class="text-link" href="/install">Install the full CLI</a></div>
+    <div class="try-notice"><span>DEMO</span><p>Sample findings, shown for the target you enter. No requests are sent to that website.</p></div>
+    <form id="demo-target-form" class="try-target-form"><div><label for="demo-target">Website</label><input id="demo-target" name="website" type="text" value="vulnerable-site.com" autocomplete="off" spellcheck="false" maxlength="2000" required></div><button class="button primary" id="demo-run" type="submit">Run demo audit</button></form>
+    <div class="try-view-tabs" role="tablist" aria-label="Demo interface"><button role="tab" id="demo-tab-gui" aria-selected="true" aria-controls="demo-panel-gui" data-demo-view="gui">GUI report</button><button role="tab" id="demo-tab-cli" aria-selected="false" aria-controls="demo-panel-cli" data-demo-view="cli" tabindex="-1">CLI terminal</button></div>
+    <section id="demo-panel-gui" class="try-gui" role="tabpanel" aria-labelledby="demo-tab-gui" tabindex="0">
+      <gilbrt-gui-demo id="actual-gui-demo" aria-label="gilbrt GUI sample report"><p class="scope-note">Loading the gilbrt GUI…</p></gilbrt-gui-demo>
+      <p id="demo-run-status" class="sr-only" role="status">Sample audit complete · 12 resources checked</p>
+    </section>
+    <section id="demo-panel-cli" class="try-cli" role="tabpanel" aria-labelledby="demo-tab-cli" tabindex="0" hidden><div class="try-terminal-bar"><span>gilbrt — terminal demo</span><span>SIMULATED SESSION</span></div><pre id="demo-terminal-output" aria-label="Demo terminal output" tabindex="0"></pre><form id="demo-command-form" class="try-command-form"><label for="demo-command" aria-label="Command prompt">$</label><input id="demo-command" type="text" aria-label="CLI demo command" autocomplete="off" spellcheck="false" maxlength="2500" value="gilbrt --url https://vulnerable-site.com --confirm-authorized"><button class="button primary" id="demo-command-run" type="submit">Run</button></form><div class="try-terminal-hints"><span>Try a command:</span><button type="button" data-demo-command="gilbrt --help">gilbrt --help</button><button type="button" data-demo-command="gilbrt --gui">gilbrt --gui</button><button type="button" data-demo-command="clear">clear</button></div><p class="try-terminal-note">This is a browser simulation. Commands never execute a shell or scan a website.</p><p id="demo-cli-status" class="sr-only" role="status"></p></section>
+    <noscript><p class="scope-note">Enable JavaScript to interact with the demo. The full CLI runs locally after installation.</p></noscript>
+  </main>
+  <footer class="wrap"><a class="brand" href="/" aria-label="gilbrt home">gilbrt<span>.</span></a><p>By <a href="https://github.com/fayekdev">fayekdev</a></p><nav aria-label="Footer navigation"><a href="/#docs">Docs</a><a href="https://github.com/fayekdev/gilbrt/issues">Issues</a><a href="https://github.com/fayekdev/gilbrt">Source</a></nav></footer>
+</body>
+</html>

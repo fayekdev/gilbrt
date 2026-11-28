@@ -12,7 +12,7 @@ from unittest.mock import patch
 import requests
 
 from gilbrt.cli import AuditCancelled
-from gilbrt.gui import APIError, DEFAULT_SETTINGS, GUIState, GUIServer, codespaces_origin, discover_models, validate_settings
+from gilbrt.gui import APIError, DEFAULT_SETTINGS, GUI_PROTOCOL, GUIState, GUIServer, codespaces_origin, discover_models, validate_settings
 
 FIXTURE_PASSWORD = "synthetic-local-fixture-password-908172"
 
@@ -26,7 +26,11 @@ class Fixture(BaseHTTPRequestHandler):
     def do_GET(self):
         self.visits.append(self.path)
         if self.path == "/robots.txt":
-            body, kind = "User-agent: *\nDisallow: /private\n", "text/plain"
+            body, kind = f"User-agent: *\nDisallow: /private\nSitemap: http://{self.headers['Host']}/sitemap.xml\n", "text/plain"
+        elif self.path == "/sitemap.xml":
+            body, kind = f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>http://{self.headers["Host"]}/unlinked.js</loc></url></urlset>', "application/xml"
+        elif self.path == "/unlinked.js":
+            body, kind = f'const dbPassword = "{FIXTURE_PASSWORD}";', "application/javascript"
         elif self.path == "/app.js":
             body, kind = f'const dbPassword = "{FIXTURE_PASSWORD}";', "application/javascript"
         elif self.path == "/api/tags":
@@ -85,6 +89,42 @@ class GUITests(unittest.TestCase):
         return self.session.post(self.base + "/api/audit", json={
             "target": self.target, "authorized": True, "settings": settings}, timeout=3)
 
+    def test_elapsed_snapshot_advances_without_progress_and_ignores_wall_clock(self):
+        self.state.job = {"status":"running", "elapsed":0}
+        self.state._job_started_monotonic = 100
+        with patch("gilbrt.gui.time.monotonic",return_value=161.2),patch("gilbrt.gui.time.time",return_value=-10000):
+            self.assertEqual(self.state.snapshot()["job"]["elapsed"],61.2)
+        self.state.job.update(status="cancelling")
+        with patch("gilbrt.gui.time.monotonic",return_value=170):
+            self.assertEqual(self.state.snapshot()["job"]["elapsed"],70)
+        self.state.job.update(status="complete",elapsed=72.3)
+        with patch("gilbrt.gui.time.monotonic",return_value=1000):
+            self.assertEqual(self.state.snapshot()["job"]["elapsed"],72.3)
+
+    def test_popup_clock_asset_is_served_under_same_origin_policy(self):
+        response=self.session.get(self.base+"/audit-clock.js",timeout=3)
+        self.assertEqual(response.status_code,200)
+        self.assertIn("GilbrtAuditClock",response.text)
+        self.assertIn("connect-src 'self'",response.headers["Content-Security-Policy"])
+        self.assertEqual(self.session.get(self.base+"/audit-clock.js",headers={"Host":"other.example"}).status_code,403)
+
+    def test_bootstrap_advertises_settings_protocol_and_rejects_unknown_settings_clearly(self):
+        bootstrap = self.session.get(self.base+"/api/bootstrap").json()
+        self.assertEqual(bootstrap["gui_protocol"], GUI_PROTOCOL)
+        self.assertIn("sitemaps", bootstrap["settings"])
+        response = self.session.post(self.base+"/api/settings", json={"obsolete_option":True})
+        self.assertEqual(response.status_code,400)
+        self.assertIn("Restart gilbrt --gui",response.json()["error"])
+        self.assertEqual(Fixture.visits,[])
+
+    def test_second_gui_cannot_share_running_gui_port(self):
+        with self.assertRaises(OSError):
+            duplicate = GUIServer(self.server.server_port, self.state)
+            duplicate.server_close()
+        response = self.session.get(self.base+"/api/bootstrap",timeout=3)
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json()["gui_protocol"],GUI_PROTOCOL)
+
     def finish(self):
         self.state.thread.join(5)
         self.assertFalse(self.state.thread.is_alive())
@@ -126,6 +166,65 @@ class GUITests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(Fixture.visits, [])
         self.assertIsNone(self.state.job)
+
+    def test_sitemaps_reach_unlinked_resources_and_respect_budget(self):
+        self.assertEqual(self.start(sitemaps=True, max_pages=8).status_code, 202)
+        data = self.finish()
+        self.assertTrue(data["report"]["metadata"]["sitemaps_enabled"])
+        self.assertIn("/sitemap.xml", Fixture.visits)
+        self.assertIn("/unlinked.js", Fixture.visits)
+        self.assertEqual(sum(finding["category"] == "Password" for finding in data["report"]["findings"]), 2)
+        Fixture.visits.clear()
+        self.assertEqual(self.start(sitemaps=True, max_pages=1).status_code, 202)
+        data = self.finish()
+        self.assertLessEqual(data["report"]["metadata"]["resources_attempted"], 1)
+        self.assertNotIn("/unlinked.js", Fixture.visits)
+
+    def test_sitemaps_disabled_by_default_and_when_robots_ignored(self):
+        for options in ({}, {"sitemaps": True, "ignore_robots": True}):
+            Fixture.visits.clear()
+            self.assertEqual(self.start(**options).status_code, 202)
+            data = self.finish()
+            self.assertFalse(data["report"]["metadata"]["sitemaps_enabled"])
+            if options.get("sitemaps"):
+                self.assertTrue(data["report"]["metadata"]["sitemaps_requested"])
+                self.assertTrue(any(f["title"] == "Sitemap discovery disabled by robots override" for f in data["report"]["findings"]))
+            self.assertNotIn("/sitemap.xml", Fixture.visits)
+            self.assertNotIn("/unlinked.js", Fixture.visits)
+
+    def test_excluded_target_rejected_before_requests(self):
+        response = self.start(exclude_domain=["127.0.0.1"])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Fixture.visits, [])
+        self.assertIsNone(self.state.job)
+
+    def test_discovery_settings_persist_and_validate(self):
+        response = self.session.post(self.base+"/api/settings", json={"sitemaps":True,"exclude_domain":["Staging.Example.","staging.example"]})
+        self.assertEqual(response.status_code, 200)
+        restored = GUIState(self.settings_path).settings
+        self.assertTrue(restored["sitemaps"])
+        self.assertEqual(restored["exclude_domain"], ["staging.example"])
+        for options in ({"sitemaps":1}, {"exclude_domain":"example.com"}, {"exclude_domain":[None]},
+                        {"exclude_domain":["https://example.com"]}, {"exclude_domain":["*.example.com"]},
+                        {"exclude_domain":["example.com"]*101}):
+            self.assertEqual(self.start(**options).status_code, 400)
+        self.assertEqual(Fixture.visits, [])
+
+    def test_per_run_limits_and_discovery_reach_shared_engine(self):
+        captured = []
+        def run(args, selected, progress, cancelled):
+            captured.append(args)
+            return [], {"resources_scanned":0}, {}
+        with patch("gilbrt.gui.run_audit", side_effect=run):
+            self.assertEqual(self.start(sitemaps=True, exclude_domain=["staging.example"], max_pages=128,
+                                        max_depth=4, max_resource_mb=32, rate_limit=.2, ignore_robots=True,
+                                        ai_max_chunks=0, ai_candidate_limit=512).status_code, 202)
+            self.finish()
+        args = captured[0]
+        self.assertEqual((args.sitemaps,args.exclude_domain,args.max_pages,args.max_depth,args.max_resource_mb,
+                          args.rate_limit,args.ignore_robots,args.ai_max_chunks,args.ai_candidate_limit),
+                         (True,["staging.example"],128,4,32,.2,True,0,512))
+        self.assertEqual(self.state.settings, DEFAULT_SETTINGS)
 
     def test_offline_file_audit_export_and_authorization(self):
         payload = {"authorized":True,"settings":{**DEFAULT_SETTINGS,"model":"","checks":["passwords","headers","tls"]},

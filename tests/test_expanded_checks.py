@@ -39,7 +39,7 @@ class ExpandedCheckTests(unittest.TestCase):
 
     def test_constant_folding_rejects_dynamic_mutable_and_oversized_expressions(self):
         examples = [
-            'let part="prefix-"; const password=part+"mutable";',
+            'let part="prefix-"; mutate(); const password=part+"mutable";',
             'const password=customDecode("Zm9v");',
             'const password=atob("not valid base64!");',
             'const password=atob(fetch("/secret"));',

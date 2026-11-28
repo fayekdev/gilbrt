@@ -76,27 +76,77 @@ def access_branch(node, data: bytes) -> bool:
 
 
 def _constant_binding(node, data: bytes):
-    """Resolve an earlier const in this exact block; never infer across scopes.
+    """Resolve an earlier const through lexical scopes, respecting shadowing.
 
     Arrays are accepted only when every reference is a join call. Any mutation,
     escape, alias, indexing or unknown use makes an array binding ineligible.
     """
-    scope = node.parent
-    while scope is not None and scope.type not in {"statement_block", "program"}:
-        scope = scope.parent
-    if scope is None or scope.end_byte - scope.start_byte > 128_000:
-        return None
     name = data[node.start_byte:node.end_byte]
     binding = None
-    for declaration in scope.named_children:
-        if declaration.type != "lexical_declaration" or not re.match(rb"const\b", data[declaration.start_byte:declaration.start_byte + 6]):
-            continue
-        for item in declaration.named_children:
-            key = item.child_by_field_name("name")
-            if key is not None and key.type == "identifier" and data[key.start_byte:key.end_byte] == name:
-                if binding is not None or item.end_byte >= node.start_byte:
+    scope = node.parent
+    budget = 4096
+    while scope is not None:
+        if scope.type in {"for_statement", "for_in_statement", "catch_clause", "class_body"}:
+            return None  # These introduce bindings requiring a different analysis.
+        if scope.type in {"function_declaration", "function_expression", "arrow_function", "method_definition"}:
+            params = scope.child_by_field_name("parameters") or scope.child_by_field_name("parameter")
+            if params is not None and re.search(rb"(?<![\w$])" + re.escape(name) + rb"(?![\w$])", data[params.start_byte:params.end_byte]):
+                return None
+            label = scope.child_by_field_name("name")
+            if label is not None and data[label.start_byte:label.end_byte] == name:
+                return None
+            body = scope.child_by_field_name("body")
+            pending = [body] if body is not None else []
+            visited = 0
+            while pending:
+                child = pending.pop()
+                visited += 1
+                if visited > 8192:
                     return None
-                binding = item.child_by_field_name("value")
+                if child.type == "variable_declaration":
+                    for item in child.named_children:
+                        key = item.child_by_field_name("name")
+                        if key is not None and re.search(rb"(?<![\w$])" + re.escape(name) + rb"(?![\w$])", data[key.start_byte:key.end_byte]):
+                            return None  # var is function-scoped, including inside branches.
+                if child.type == "call_expression":
+                    target = child.child_by_field_name("function")
+                    if target is not None and data[target.start_byte:target.end_byte] == b"eval":
+                        return None
+                if child.type not in {"string", "comment", "regex", "function_declaration", "function_expression", "arrow_function"}:
+                    pending.extend(child.named_children)
+        if scope.type in {"statement_block", "program"}:
+            if scope.end_byte - scope.start_byte > 128_000:
+                return None
+            for declaration in scope.named_children:
+                budget -= 1
+                if budget < 0:
+                    return None
+                if declaration.type == "export_statement":
+                    declaration = declaration.child_by_field_name("declaration") or declaration
+                if declaration.type not in {"lexical_declaration", "variable_declaration"}:
+                    # Imports, function/class declarations can shadow outer names.
+                    label = declaration.child_by_field_name("name")
+                    if label is not None and data[label.start_byte:label.end_byte] == name:
+                        return None
+                    if declaration.type == "import_statement" and re.search(rb"(?<![\w$])" + re.escape(name) + rb"(?![\w$])", data[declaration.start_byte:declaration.end_byte]):
+                        return None
+                    continue
+                for item in declaration.named_children:
+                    key = item.child_by_field_name("name")
+                    if key is None:
+                        continue
+                    if key.type != "identifier":
+                        if re.search(rb"(?<![\w$])" + re.escape(name) + rb"(?![\w$])", data[key.start_byte:key.end_byte]):
+                            return None
+                        continue
+                    if data[key.start_byte:key.end_byte] == name:
+                        if (binding is not None or item.end_byte >= node.start_byte or
+                                not re.match(rb"const\b", data[declaration.start_byte:declaration.start_byte + 6])):
+                            return None
+                        binding = item.child_by_field_name("value")
+            if binding is not None:
+                break
+        scope = scope.parent
     if binding is None:
         return None
     if binding.type == "array":
@@ -169,6 +219,65 @@ def node_literal(node, data: bytes) -> str | None:
     """
     budget = [128]
 
+    def mutable_scalar(part, depth):
+        """Track only straight-line local scalar writes preceding this use.
+
+        Calls, control flow, unknown expressions, redeclarations and escapes
+        stop resolution. Mutable values are never propagated across a closure.
+        """
+        scope = part.parent
+        while scope is not None and scope.type not in {"statement_block", "program"}:
+            if scope.type in {"function_declaration", "function_expression", "arrow_function", "for_statement", "for_in_statement", "catch_clause"}:
+                return None
+            scope = scope.parent
+        if scope is None or scope.end_byte - scope.start_byte > 128000:
+            return None
+        name = data[part.start_byte:part.end_byte]
+        value = None
+        for statement in scope.named_children:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return None
+            if statement.end_byte >= part.start_byte:
+                break
+            if statement.type in {"comment", "empty_statement"}:
+                continue
+            if statement.type in {"lexical_declaration", "variable_declaration"}:
+                for item in statement.named_children:
+                    key = item.child_by_field_name("name")
+                    expression = item.child_by_field_name("value")
+                    if key is not None and key.type == "identifier" and data[key.start_byte:key.end_byte] == name:
+                        if value is not None:
+                            return None
+                        value = fold(expression, depth + 1)
+                        if not isinstance(value, (str, int)):
+                            return None
+                    elif value is not None and not isinstance(fold(expression, depth + 1), (str, int)):
+                        return None
+                continue
+            expression = statement.named_children[0] if statement.type == "expression_statement" and statement.named_child_count == 1 else None
+            if value is None:
+                continue
+            if expression is None or expression.type not in {"assignment_expression", "augmented_assignment_expression"}:
+                return None
+            left = expression.child_by_field_name("left")
+            if left is None or left.type != "identifier" or data[left.start_byte:left.end_byte] != name:
+                return None
+            right = fold(expression.child_by_field_name("right"), depth + 1)
+            if not isinstance(right, (str, int)):
+                return None
+            operator = expression.child_by_field_name("operator")
+            op = data[operator.start_byte:operator.end_byte] if operator is not None else b"="
+            if op == b"=":
+                value = right
+            elif op == b"+=" and (isinstance(value, str) or isinstance(right, str)):
+                value = str(value) + str(right)
+            else:
+                return None
+            if len(str(value)) > 512:
+                return None
+        return value
+
     def fold(part, depth=0):
         budget[0] -= 1
         if part is None or depth > 10 or budget[0] < 0 or part.end_byte - part.start_byte > 4096:
@@ -184,7 +293,8 @@ def node_literal(node, data: bytes) -> str | None:
                 return None  # Avoid legacy octal and JavaScript precision differences.
             return int(value) if value is not None and part.type == "number" else value
         if part.type == "identifier":
-            return fold(_constant_binding(part, data), depth + 1)
+            binding = _constant_binding(part, data)
+            return fold(binding, depth + 1) if binding is not None else mutable_scalar(part, depth + 1)
         if part.type == "binary_expression":
             op = part.child_by_field_name("operator")
             if op is None or data[op.start_byte:op.end_byte] != b"+":
@@ -284,7 +394,7 @@ def callback_input_kind(node, other, data: bytes) -> str | None:
     return None
 
 
-def review_control(node, data: bytes) -> bool:
+def review_control(node, data: bytes, other=None) -> bool:
     """Broader AI-only pool: literal checks in returning/security-related code.
 
     This is syntax grounding, not a verdict that a literal is a credential. The
@@ -302,6 +412,13 @@ def review_control(node, data: bytes) -> bool:
                 function = args.parent.child_by_field_name("function")
                 prop = function.child_by_field_name("property") if function is not None and function.type == "member_expression" else None
                 if prop is not None and data[prop.start_byte:prop.end_byte].decode() in COLLECTION_CALLBACKS:
+                    return False
+                # A returning callback is not evidence about its input when the
+                # compared value is an unrelated closure/global variable.
+                params = enclosing.child_by_field_name("parameters") or enclosing.child_by_field_name("parameter")
+                parameters = params.named_children if params is not None and params.type == "formal_parameters" else [params] if params is not None else []
+                names = {data[p.start_byte:p.end_byte].decode() for p in parameters if p.type == "identifier"}
+                if other is None or not names.intersection(subject_names(other, data)):
                     return False
             name = enclosing.child_by_field_name("name")
             if name is None and enclosing.parent is not None and enclosing.parent.type == "variable_declarator":
@@ -356,7 +473,7 @@ def secret_literals(text: str) -> Iterator[tuple[str, int]]:
         if subject is None or subject.end_byte - subject.start_byte > 256:
             continue
         names = [re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name) for name in subject_names(subject, data)]
-        if not any(re.search(r"(?:^|[_-])(?:api[_-]?key|key|token|secret|authorization)(?:$|[_-])", name, re.I) for name in names):
+        if not any(PASSWORD_NAME.search(name) or CODE_NAME.search(name) or re.search(r"(?:^|[_-])(?:api[_-]?key|key|token|secret|authorization)(?:$|[_-])", name, re.I) for name in names):
             continue
         value_node = node.child_by_field_name("value" if node.type in {"pair", "variable_declarator"} else "right")
         value = node_literal(value_node, data)
@@ -418,7 +535,7 @@ def candidates(text: str, limit: int = 128, include_password_assignments: bool =
             continue
         if not named and (not comparison or len(value) < 4 or not access_branch(node, data)):
             if not (review and comparison and value.lower() not in REVIEW_STATES and 4 <= len(value) <= 512 and not value.startswith(("/", "http:", "https:"))
-                    and "/" not in value and review_control(node, data)):
+                    and "/" not in value and review_control(node, data, other)):
                 continue
         if not comparison and password and not include_password_assignments:
             continue  # The dedicated password-assignment check handles these.

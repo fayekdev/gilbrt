@@ -6,6 +6,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import threading
 import time
 import webbrowser
@@ -21,12 +22,16 @@ from .crawler import ScopedClient, normalize
 from .local_ai import loopback_url
 from .model_install import MODELS
 from .reporter import SEVERITIES, render_report, report_document
+from .report_store import REPORT_NAME, read_report
 from .scanner import CONTENT_CHECKS, mask
+from .scope import domain_name
 
 ASSETS = Path(__file__).with_name("gui_assets")
+GUI_PROTOCOL = 2
 DEFAULT_SETTINGS = {
     "max_pages": 25, "max_depth": 2, "max_resource_mb": 16, "rate_limit": 1.0,
-    "ignore_robots": False, "checks": DEFAULT_CHECKS, "model": "",
+    "ignore_robots": False, "sitemaps": False, "exclude_domain": [],
+    "checks": DEFAULT_CHECKS, "model": "",
     "ollama_url": "http://127.0.0.1:11434", "ai_max_chunks": None,
     "ai_candidate_limit": 256, "export_format": "json",
 }
@@ -42,8 +47,10 @@ class APIError(Exception):
 
 def validate_settings(data):
     """Validate all settings before saving or using them; never accept CLI flags."""
-    if not isinstance(data, dict) or set(data) - DEFAULT_SETTINGS.keys():
-        raise APIError("Unknown settings or invalid settings object.")
+    if not isinstance(data, dict):
+        raise APIError("Settings must be a JSON object.")
+    if set(data) - DEFAULT_SETTINGS.keys():
+        raise APIError("Unsupported settings. Restart gilbrt --gui and refresh the page after updating.")
     result = {**copy.deepcopy(DEFAULT_SETTINGS), **data}
     for key, low, high in (("max_pages", 1, 10000), ("max_depth", 0, 20),
                            ("max_resource_mb", 1, 64), ("ai_candidate_limit", 24, 4096)):
@@ -56,8 +63,16 @@ def validate_settings(data):
     delay = result["rate_limit"]
     if type(delay) not in (int, float) or not math.isfinite(delay) or not 0 <= delay <= 3600:
         raise APIError("Request delay must be a finite number between 0 and 3600 seconds.")
-    if type(result["ignore_robots"]) is not bool:
-        raise APIError("Robots preference must be true or false.")
+    for key in ("ignore_robots", "sitemaps"):
+        if type(result[key]) is not bool:
+            raise APIError(f"{key} must be true or false.")
+    domains = result["exclude_domain"]
+    if not isinstance(domains, list) or len(domains) > 100 or any(not isinstance(d, str) or len(d) > 253 for d in domains):
+        raise APIError("Use at most 100 excluded bare domain names.")
+    try:
+        result["exclude_domain"] = list(dict.fromkeys(domain_name(d) for d in domains))
+    except (ValueError, UnicodeError):
+        raise APIError("Excluded domains must be bare names, without URLs, ports or wildcards.") from None
     checks = result["checks"]
     if not isinstance(checks, list) or not checks or any(not isinstance(x, str) or x not in DEFAULT_CHECKS for x in checks):
         raise APIError("Select at least one valid static audit check.")
@@ -112,9 +127,9 @@ def discover_models(base_url):
 
 
 class GUIState:
-    """One local audit at a time; reports and targets are never persisted."""
+    """One local audit at a time; optionally restore an explicitly saved CLI report."""
 
-    def __init__(self, settings_path=None):
+    def __init__(self, settings_path=None, report_path=None):
         self.settings_path = settings_path or RUNTIME / "gui-settings.json"
         self.lock = threading.RLock()
         self.token = secrets.token_urlsafe(32)
@@ -129,6 +144,56 @@ class GUIState:
         self.report_id = ""
         self.revealed_evidence = {}
         self.thread = None
+        self._job_started_monotonic = None
+        self.saved_report_path = Path(report_path) if report_path is not None else self.settings_path.parent / REPORT_NAME
+        self._saved_report_stamp = None
+        self._last_finished_ns = 0
+        self.saved_report_error = None
+        self._refresh_saved_report(strict=report_path is not None)
+
+    def _refresh_saved_report(self, strict=False):
+        """Pick up newly saved CLI results on reload; never replace a running audit."""
+        if self.job and self.job["status"] in {"running", "cancelling"}:
+            return
+        try:
+            stat = self.saved_report_path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if stamp == self._saved_report_stamp:
+                return
+            self._saved_report_stamp = stamp
+            if stat.st_mtime_ns <= self._last_finished_ns:
+                return
+            document = read_report(self.saved_report_path)
+        except (OSError, ValueError) as error:
+            if strict:
+                raise ValueError("Cannot open GUI report. Use a valid gilbrt JSON export.") from error
+            if self.saved_report_path.exists():
+                self.saved_report_error = "The saved CLI report could not be loaded. Export it again using --save-gui."
+            return
+        from .scanner import safe_url
+        target = document["metadata"].get("target", "")
+        try:
+            parsed = urlsplit(target) if isinstance(target, str) else None
+            host = f"[{parsed.hostname}]" if parsed and parsed.hostname and ":" in parsed.hostname else parsed.hostname if parsed else None
+            origin = f"{parsed.scheme}://{host}" if parsed and parsed.scheme in {"http", "https"} and host else "Saved CLI report"
+            if parsed and parsed.scheme in {"http", "https"} and parsed.port:
+                origin = origin + ":" + str(parsed.port)
+        except ValueError:
+            origin = "Saved CLI report"
+        document["session"] = {"target_origin": origin, "elapsed": 0, "source": "saved CLI report"}
+        failed = document["assessment"]["status"] == "source_scan_failed"
+        identifier = secrets.token_hex(8)
+        self.report = document
+        self.report_id = identifier
+        self.revealed_evidence = {}
+        self.saved_report_error = None
+        self._last_finished_ns = stat.st_mtime_ns
+        self.job = {"id": identifier, "status": "failed" if failed else "complete", "source": "cli",
+                    "target": safe_url(target) if isinstance(target, str) and target.startswith(("http://", "https://")) else "Saved CLI report",
+                    "started_at": stat.st_mtime, "elapsed": 0, "events": [], "stage": "Loaded saved CLI results",
+                    "resources_scanned": document["metadata"].get("resources_scanned", 0), "findings": len(document["findings"])}
+        if failed:
+            self.job["error"] = document["assessment"]["summary"]
 
     def save_settings(self, data):
         settings = validate_settings(data)
@@ -142,12 +207,21 @@ class GUIState:
 
     def snapshot(self, known_report=None):
         with self.lock:
+            self._refresh_saved_report()
             # Reports are replaced atomically and never mutated after publication.
             # Copy only the small mutable job; unchanged polls omit the report.
             result = {"job": copy.deepcopy(self.job), "report_id": self.report_id}
+            if result["job"] and result["job"]["status"] in {"running", "cancelling"}:
+                result["job"]["elapsed"] = self._elapsed()
             if known_report is None or known_report != self.report_id:
                 result["report"] = self.report
             return result
+
+    def _elapsed(self):
+        """Keep duration independent of progress events and wall-clock changes."""
+        if self._job_started_monotonic is None:
+            return max(0, (self.job or {}).get("elapsed", 0))
+        return round(max(0, time.monotonic() - self._job_started_monotonic), 1)
 
     def evidence(self, report_id, index):
         with self.lock:
@@ -180,7 +254,10 @@ class GUIState:
             raise APIError("Use at most 100 additional same-origin resource URLs.")
         from urllib.parse import urljoin
         if not offline:
-            scope = ScopedClient(target)
+            try:
+                scope = ScopedClient(target, exclude_domains=settings["exclude_domain"])
+            except ValueError as error:
+                raise APIError(str(error)) from None
             try:
                 if any(not scope.allowed(urljoin(target, item)) for item in includes):
                     raise APIError("Additional resource URLs must match the target's exact origin.")
@@ -193,6 +270,7 @@ class GUIState:
             if settings["model"] and settings["model"] not in {m["id"] for m in discover_models(settings["ollama_url"])["choices"]}:
                 raise APIError("The selected local model is not installed or reachable. Refresh models in Settings.")
             self.cancel.clear()
+            self._job_started_monotonic = time.monotonic()
             self.job = {"id": secrets.token_hex(8), "status": "running", "target": target,
                         "mode": "files" if offline else "website",
                         "started_at": time.time(), "elapsed": 0, "events": [], "stage": "Preparing audit",
@@ -219,7 +297,7 @@ class GUIState:
             def progress(event):
                 with self.lock:
                     self.job.update({key: value for key, value in event.items() if key in {"stage", "resources_scanned", "findings"}})
-                    self.job["elapsed"] = round(time.time() - self.job["started_at"], 1)
+                    self.job["elapsed"] = self._elapsed()
                     self.job["events"].append({**event, "elapsed": self.job["elapsed"]})
                     self.job["events"] = self.job["events"][-60:]
 
@@ -238,21 +316,24 @@ class GUIState:
                     raise AuditCancelled()
                 self.report = report_document(findings, metadata)
                 self.report["session"] = {"target_origin": "Local files" if files is not None else f"{urlsplit(target).scheme}://{urlsplit(target).netloc}",
-                                          "elapsed": round(time.time() - self.job["started_at"], 1)}
+                                          "elapsed": self._elapsed()}
                 self.revealed_evidence = revealed
                 self.report_id = self.job["id"]
                 self.job.update(status="complete", stage="Audit complete", elapsed=self.report["session"]["elapsed"])
+                self._last_finished_ns = time.time_ns()
                 if self.report["assessment"]["status"] == "source_scan_failed":
                     self.job.update(status="failed", stage="Source scan incomplete", error=self.report["assessment"]["summary"])
         except AuditCancelled:
             with self.lock:
-                self.job.update(status="cancelled", stage="Audit cancelled", elapsed=round(time.time() - self.job["started_at"], 1))
+                self._last_finished_ns = time.time_ns()
+                self.job.update(status="cancelled", stage="Audit cancelled", elapsed=self._elapsed())
         except Exception:
             # Never return exception messages or source text to the browser or logs.
             with self.lock:
+                self._last_finished_ns = time.time_ns()
                 self.job.update(status="failed", stage="Audit failed",
                                 error="Audit failed. Check scope, selected model availability, and tool configuration.",
-                                elapsed=round(time.time() - self.job["started_at"], 1))
+                                elapsed=self._elapsed())
 
     def cancel_audit(self):
         with self.lock:
@@ -282,6 +363,13 @@ def codespaces_origin(port):
 
 class GUIServer(ThreadingHTTPServer):
     daemon_threads = True
+    # SO_REUSEADDR permits competing listeners on Windows, unlike Unix.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, port=4174, state=None):
         self.state = state or GUIState()
@@ -343,6 +431,7 @@ class GUIHandler(BaseHTTPRequestHandler):
             state = self.server.state
             if path == "/api/bootstrap":
                 return self._send({"token": state.token, "settings": state.settings, "checks": DEFAULT_CHECKS,
+                                   "gui_protocol": GUI_PROTOCOL,
                                    "content_checks": sorted(CONTENT_CHECKS),
                                    "hibp_available": bool(os.environ.get("HIBP_API_KEY")), **state.snapshot()})
             if path == "/api/state":
@@ -379,6 +468,7 @@ class GUIHandler(BaseHTTPRequestHandler):
                                   filename="gilbrt-report." + ("md" if fmt == "ai" else fmt))
             assets = {"/": ("index.html", "text/html"), "/index.html": ("index.html", "text/html"),
                       "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css"),
+                      "/audit-clock.js": ("audit-clock.js", "text/javascript"),
                       "/mascot.svg": ("mascot.svg", "image/svg+xml")}
             if path not in assets:
                 raise APIError("Not found.", 404)
@@ -418,20 +508,29 @@ class GUIHandler(BaseHTTPRequestHandler):
             self._send({"error": "Invalid request or settings could not be saved."}, 400)
 
 
-def serve(port=4174, open_browser=True):
+def serve(port=4174, open_browser=True, report_path=None):
     if not 1 <= port <= 65535:
         print("GUI port must be between 1 and 65535.")
         return 1
     try:
-        server = GUIServer(port)
+        state = GUIState(report_path=report_path)
+        server = GUIServer(port, state)
+    except ValueError:
+        print("Unable to open GUI report. Supply a valid gilbrt JSON export with --gui-report.")
+        return 1
     except OSError:
         print("GUI port is unavailable. Choose another with --gui-port.")
         return 1
     print(f"gilbrt GUI: {server.origin} (local only; Ctrl+C to stop)", flush=True)
+    if state.saved_report_error:
+        print(state.saved_report_error, flush=True)
     if server.forwarded_origin:
         print(f"Codespaces GUI: {server.forwarded_origin} (keep port visibility Private)", flush=True)
     if open_browser and os.environ.get("CODESPACES") != "true":
-        webbrowser.open(server.origin)
+        try:
+            webbrowser.open(server.origin)
+        except webbrowser.Error:
+            print("No local browser available. Open the URL on this machine, or use SSH port forwarding.", flush=True)
     try:
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:

@@ -52,7 +52,122 @@ and the built-in website exclusions also apply to GUI audits.
 The GUI matches the website's dark/sage palette and provides Audit, Findings,
 Resources and Settings views. Findings can be filtered by severity and category.
 Matched values are masked until **Show matched value** is selected in a finding;
-exports remain redacted.
+exports remain redacted. In **Export**, select a format and choose **Download**
+or **Copy to clipboard**. Clipboard export copies that format as text using the
+server's redacted export, even after revealing evidence locally.
+
+Open **New audit → Audit options** to set the resource limit, crawl depth,
+resource size, request delay, sitemap discovery, robots handling and AI review
+limits for that run. **Additional URLs** accepts explicit
+same-origin resources. Save defaults under **Settings → Audit limits** and
+**Local model**. Domain exclusions stay in Settings and apply to each audit;
+they include their subdomains. Sitemap discovery
+uses declarations in robots.txt and shares the resource budget; ignoring
+robots.txt also disables sitemap discovery. Website-only options are hidden for
+offline file audits. Restart `gilbrt --gui` after updating to load the new options.
+The GUI checks its server protocol before enabling audits and shows a restart
+instruction if an older process is still serving updated interface files.
+
+Checks are grouped under a collapsible selection panel. Slide **Slide to
+authorize** fully, then click the filled green pill to start. The entire pill
+changes color from red through amber to green as it fills. Moving the slider
+alone does not start an audit. Editing the setup or switching the
+source resets confirmation. Severity dials show each severity's share of reported
+findings; click a dial to filter the findings. They are not a security score.
+
+The running-audit popup shows an **Elapsed** counter in `MM:SS` (or `HH:MM:SS`
+for longer audits). It updates every second while network/model calls are pending,
+restores the elapsed duration after a reload, and keeps counting during
+cancellation until the backend has actually stopped. Restart the GUI server after
+updating to load its timer asset and live duration reporting.
+
+### Keep CLI results for the GUI
+
+Add `--save-gui` to an authorized CLI audit, then open the GUI later:
+
+```bash
+gilbrt --url https://staging.your-domain.example --confirm-authorized --save-gui
+gilbrt --gui
+```
+
+The audit command finishes normally. Its redacted result is saved atomically to
+`GILBRT_RUNTIME/last-cli-report.json` (normally `.runtime/last-cli-report.json`).
+Each `--save-gui` run replaces that one saved CLI report; use `--output` as well
+to keep named history. This is opt-in: ordinary CLI audits do not save a GUI report.
+Raw source bodies, terminal `--show-secrets` values, session tokens and API keys
+are not added to this saved result. Restored reports cannot reveal plaintext
+matched values. POSIX temporary files use private permissions; Windows uses the
+runtime directory's ACLs. Keep that directory private to your account.
+
+The GUI restores the saved report on startup. If the GUI was already open, reload
+the page after the CLI audit to pick up a newer saved result. It will not interrupt
+an audit in progress or replace a newer completed in-memory GUI audit with an
+older file. Normal GUI audits still keep their results in memory only.
+
+To view an existing JSON export without auditing the website again:
+
+```bash
+gilbrt --gui-report audit.json
+```
+
+Only gilbrt JSON reports up to 32 MiB and 50,000 findings are accepted. Imported
+data is treated as untrusted text, its assessment is recomputed, and no discovered
+URL is fetched. Missing or invalid explicitly selected reports fail with a clear
+error; an invalid default saved report leaves the GUI available for a new audit.
+
+### Headless remote GUI through SSH
+
+On the remote machine, start the GUI without trying to launch a browser:
+
+```bash
+gilbrt --gui --no-browser
+```
+
+On your own computer, keep an authenticated SSH forwarding session open:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:4174:127.0.0.1:4174 user@remote-host
+```
+
+Open `http://127.0.0.1:4174` locally. The GUI remains bound to remote loopback; SSH
+provides the authenticated encrypted connection. Use matching local and remote
+ports so the GUI's exact Host/Origin checks continue to work. If 4174 is occupied,
+use `--gui-port 4175` and change all three ports in the forwarding command to 4175.
+The GUI session token and cross-site request checks remain enabled. SSH forwarding
+uses OpenSSH's documented [`-L` local forwarding](https://man.openbsd.org/ssh.1#L).
+
+### Third-party AI and public tunnel design (planned)
+
+Third-party inference is not enabled by these report/viewing commands. The proposed
+next step is an explicit provider adapter alongside the existing bundled/Ollama
+backends, with the same syntax-grounded candidate IDs and local evidence checks.
+Provider/model selection must be separate from local model tags. API credentials
+stay in server environment variables or an OS credential store, never browser
+settings, report files, command-line arguments or prompt logs.
+
+Before a remote review, the operator should see which provider/model is selected,
+what source excerpts would leave the machine, and the request/token budget. Start
+with minimal candidate context and locally substituted credential placeholders;
+keep the original values only in local memory. Sending raw source would require
+a separate explicit choice. Apply timeouts, bounded responses, request/token caps
+and budget-aware retries. No automatic cloud fallback when local inference fails.
+Use provider-supported structured responses where available, then independently
+validate candidate IDs and source evidence. A schema controls response shape; it
+does not prove the model's classification. See [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+for one provider's schema mechanism. Compare each provider against the same seeded
+lab for detections, misses, incremental false alarms, coverage, latency and usage.
+
+SSH is the first supported remote-access path. Future managed options could use
+[Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) within a
+private tailnet, or a tunnel protected by
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/).
+These integrations are not wired into gilbrt yet. They need an explicitly configured
+external origin, authentication covering the entire UI including bootstrap,
+appropriate identity-token verification, and session/CSRF protections behind the
+proxy. A GUI bootstrap token is not a substitute for remote user authentication.
+Do not expose an unauthenticated quick tunnel or bind the service to `0.0.0.0` to
+work around Host/Origin checks. No public tunnel or provider account is created
+by the commands above.
 
 ### Offline use
 
@@ -119,8 +234,9 @@ Open **Settings** to save crawl limits, request pacing, default checks, export
 format, model selection, the loopback Ollama address, AI batch budget, and bundled
 candidate limits. Settings apply to future audits and are saved to
 `GILBRT_RUNTIME/gui-settings.json` (normally `.runtime/gui-settings.json`). Audit
-targets, findings and source bodies are not automatically written to disk. The
-current completed report stays in server memory until replaced or the server stops.
+targets, findings and source bodies are not automatically written to disk. An
+explicit CLI `--save-gui` run saves its redacted report as described above. Normal
+GUI results stay in server memory until replaced or the server stops.
 
 The model dropdown lists the installed bundled CPU model and installed local
 Ollama models; cloud-backed entries are excluded. Use `gilbrt --install-models`
@@ -130,6 +246,51 @@ local AI. HIBP catalogue checks use `HIBP_API_KEY` from the launch environment,
 when present; the GUI does not store that key.
 
 ## Local accuracy benchmark
+
+For a harder integration test, use the seeded multi-resource laboratory:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.benchmark_lab --with-ai
+```
+
+This creates 46 content cases (28 intended findings and 18 harmless controls),
+six header contracts, six explicitly configured synthetic API/AI endpoint checks,
+and robots/cross-origin traps. Credentials, resource paths, import ordering and
+line padding change with `--seed`; the default is `20261127`. A credential only
+scores when the detector recovers its entire expected value in the correct
+resource and category. Matching a fragment, repeating observations or reporting
+missing headers cannot increase the content score. Unreached positive cases count
+as misses; unreached harmless controls never count as true negatives.
+
+The lab runs separate resource-count, depth and per-file-size limit profiles,
+then a broad static audit, a static audit with an explicitly supplied runtime API
+URL, and (with `--with-ai`) the actual installed bundled model. `--model TAG` selects
+an installed Ollama model instead. No model is downloaded automatically. Reports
+distinguish discovery misses from analysis misses and record AI-only gains and
+false alarms. Complete results, redacted reports and the ground-truth manifest are
+saved under `.runtime/hard-lab/`; change the destination with `--output-dir`.
+
+To use the lab as a local target in the GUI, keep this command running:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.benchmark_lab --serve --port 8765
+```
+
+Audit `http://127.0.0.1:8765/` with a resource limit of 128, depth 4 and sitemap
+discovery enabled to reproduce broad passive discovery. Active checks require the
+generated `active-config.json` and synthetic environment values shown in
+`scripts/benchmark_lab.py`; the automatic benchmark configures them itself. The
+server binds only to loopback. Ctrl+C stops it. Do not deploy this deliberately
+vulnerable lab to public hosting.
+
+Its cases include custom password callbacks, Unicode hydration JSON, split and
+encoded secrets, source maps reached through CSS imports, nested iframes, deep
+links, sitemaps, large embedded assets, browser-input aliases, cross-module and
+mutable data flow, runtime-only APIs, and harmless UI/documentation examples.
+Known unsupported cases remain in the denominator. HTTP/record/AI endpoint probes
+use deterministic synthetic responses; the chat stubs do not establish an actual
+LLM's prompt-injection resistance. This lab does not test SQL injection or execute
+target JavaScript, validate real provider credentials, or prove XSS exploitation.
 
 Reports start with a coverage assessment and distinguish credential candidates
 from header/TLS configuration observations. A header-only result does not establish
@@ -210,6 +371,24 @@ catalogues, or actual model prompt-injection resistance. HSTS warnings are exclu
 from header scoring because the demo intentionally uses loopback HTTP.
 
 ## Install and run
+
+If the command still points at a deleted or moved checkout, repair it from the
+checkout you want to use:
+
+```bash
+cd ~/PROJECTS/gilbrt
+bash install.sh --relink
+hash -r
+gilbrt --gui --no-browser
+```
+
+`--relink` rewrites the generated `~/.local/bin/gilbrt` launcher to this checkout's
+`bin/gilbrt`. It backs up a previous generated launcher under a unique
+`gilbrt.backup.*` name, preserves argument quoting, and does not download models,
+reinstall Python dependencies or edit shell startup files. `--prefix DIRECTORY`
+can select a different command directory. Unrelated commands and modified launchers
+are left untouched. If the new checkout has no working Python environment, run
+`bash install.sh` afterward; a normal install can also repair a stale owned launcher.
 
 From Bash on Linux or Git Bash on Windows:
 

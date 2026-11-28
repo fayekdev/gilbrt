@@ -157,6 +157,10 @@ class Crawler:
     def load_robots(self) -> None:
         """Treat missing robots as unrestricted, other failures as deny-all."""
         if self.ignore_robots:
+            if self.discover_sitemaps:
+                self.client.errors.append(Finding("Info", "Coverage", "Sitemap discovery disabled by robots override",
+                    safe_url(self.client.target), "Sitemaps were requested, but robots.txt declarations were not loaded because robots handling was disabled.",
+                    "Respect robots.txt to discover declared sitemaps, or supply known same-origin page URLs explicitly."))
             return
         url = urljoin(self.client.target, "/robots.txt")
         response = self.client.get(url)
@@ -195,6 +199,8 @@ class Crawler:
             response = self.client.get(url, self.permitted)
             if response is None:
                 continue
+            if response.url != url and response.url in self.visited:
+                continue  # A redirect to an already scanned resource is not another finding source.
             self.visited.add(response.url)
             content_type = response.headers.get("Content-Type", "").lower()
             html = "html" in content_type

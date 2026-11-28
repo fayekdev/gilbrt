@@ -101,6 +101,55 @@ def browser_code(text, url, line_offset=0):
     def raw(node):
         return data[node.start_byte:node.end_byte].decode("utf-8", errors="replace") if node else ""
 
+    def parameter_sources(node):
+        """Connect an unmodified local function parameter to direct local calls.
+
+        Reject reassigned/escaped functions, parameter writes, eval, complex
+        parameters and nested call sites. This is a bounded syntax relation,
+        not execution or a claim that a sink can be exploited.
+        """
+        function = node.parent
+        while function is not None and function.type not in {"function_declaration", "function_expression", "arrow_function", "method_definition"}:
+            function = function.parent
+        if function is None or function.type != "function_declaration":
+            return []
+        scope = function.parent
+        name = function.child_by_field_name("name")
+        params = function.child_by_field_name("parameters")
+        if (scope is None or scope.type not in {"program", "statement_block"} or scope.end_byte - scope.start_byte > 128000
+                or name is None or params is None or any(p.type != "identifier" for p in params.named_children)):
+            return []
+        names = [raw(p) for p in params.named_children]
+        if raw(node) not in names:
+            return []
+        position = names.index(raw(node))
+        calls = []
+        pending = [scope]
+        visited = 0
+        while pending:
+            child = pending.pop()
+            visited += 1
+            if visited > 8192:
+                return []
+            if child.type == "identifier" and raw(child) == raw(name) and child != name:
+                parent = child.parent
+                if (parent.type != "call_expression" or parent.child_by_field_name("function") != child
+                        or parent.parent.type != "expression_statement" or parent.parent.parent != scope):
+                    return []
+                args = parent.child_by_field_name("arguments")
+                if args is not None and position < args.named_child_count:
+                    calls.append(args.named_children[position])
+            if function.start_byte <= child.start_byte < function.end_byte:
+                if child.type in {"assignment_expression", "augmented_assignment_expression", "variable_declarator", "update_expression"}:
+                    target = child.child_by_field_name("left") or child.child_by_field_name("name") or child.child_by_field_name("argument")
+                    if target is not None and re.search(r"(?<![\w$])" + re.escape(raw(node)) + r"(?![\w$])", raw(target)):
+                        return []
+                if child.type == "call_expression" and raw(child.child_by_field_name("function")) == "eval":
+                    return []
+            if child.type not in {"string", "template_string", "regex", "comment"}:
+                pending.extend(child.named_children)
+        return calls
+
     def browser_input(node, depth=0):
         if node is None or depth > 8 or node.end_byte - node.start_byte > 4096:
             return False
@@ -112,6 +161,8 @@ def browser_code(text, url, line_offset=0):
             binding = _constant_binding(node, data)
             if binding is not None:
                 return browser_input(binding, depth + 1)
+            if any(browser_input(argument, depth + 1) for argument in parameter_sources(node)):
+                return True
             # Recognize only same-block const destructuring of known location
             # string properties. Unknown aliases and mutable bindings fail closed.
             scope = node.parent

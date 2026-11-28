@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "buildCommand": "node scripts/sync-readme.mjs",
+  "buildCommand": "node scripts/sync-assets.mjs",
   "outputDirectory": "public",
   "headers": [
     {
@@ -43,6 +43,10 @@
     {
       "source": "/install",
       "destination": "/install.html"
+    },
+    {
+      "source": "/try",
+      "destination": "/try.html"
     }
   ]
 }
